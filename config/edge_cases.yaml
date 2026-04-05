@@ -1,0 +1,275 @@
+# Phantom Edge Case Library
+# Each category defines a set of adversarial inputs for form fuzzing
+
+string_attacks:
+  - name: "Empty submission"
+    value: ""
+    description: "Submit form with completely empty fields"
+    category: boundary
+
+  - name: "SQL Injection - Classic OR"
+    value: "' OR 1=1 --"
+    description: "Classic SQL injection to bypass authentication"
+    category: security
+
+  - name: "SQL Injection - UNION SELECT"
+    value: "' UNION SELECT null, username, password FROM users --"
+    description: "UNION-based SQL injection"
+    category: security
+
+  - name: "SQL Injection - Drop Table"
+    value: "'; DROP TABLE users; --"
+    description: "Destructive SQL injection"
+    category: security
+
+  - name: "XSS - Script Alert"
+    value: "<script>alert(1)</script>"
+    description: "Basic reflected XSS payload"
+    category: security
+
+  - name: "XSS - Image onerror"
+    value: "<img src=x onerror=alert(1)>"
+    description: "Image-based XSS payload"
+    category: security
+
+  - name: "XSS - SVG"
+    value: "<svg onload=alert(1)>"
+    description: "SVG-based XSS payload"
+    category: security
+
+  - name: "Max length string"
+    value: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    description: "10,000 character string to test length limits"
+    category: boundary
+
+  - name: "Unicode - Japanese"
+    value: "日本語テスト"
+    description: "Japanese Unicode characters"
+    category: encoding
+
+  - name: "Unicode - Arabic RTL"
+    value: "مرحبا بالعالم"
+    description: "Arabic right-to-left text"
+    category: encoding
+
+  - name: "Unicode - Emoji"
+    value: "🔥💀🚀😈🤖"
+    description: "Emoji characters"
+    category: encoding
+
+  - name: "Unicode - Null byte"
+    value: "test\x00injection"
+    description: "Null byte injection"
+    category: security
+
+  - name: "Unicode - Zero-width space"
+    value: "test​injection"
+    description: "Zero-width space characters"
+    category: encoding
+
+  - name: "Whitespace only"
+    value: "   "
+    description: "Only whitespace characters"
+    category: boundary
+
+  - name: "Newline injection"
+    value: "line1\nline2\nline3"
+    description: "Newline characters in input"
+    category: boundary
+
+  - name: "HTML injection"
+    value: "<b>bold</b><i>italic</i>"
+    description: "HTML tags in input"
+    category: security
+
+  - name: "Path traversal"
+    value: "../../../../etc/passwd"
+    description: "Directory traversal attempt"
+    category: security
+
+  - name: "Command injection"
+    value: "; ls -la; echo"
+    description: "Command injection attempt"
+    category: security
+
+numeric_attacks:
+  - name: "Negative number"
+    value: "-1"
+    description: "Negative number where positive expected"
+    category: boundary
+
+  - name: "Zero"
+    value: "0"
+    description: "Zero value"
+    category: boundary
+
+  - name: "Very large number"
+    value: "999999999999999"
+    description: "Extremely large number"
+    category: boundary
+
+  - name: "Float instead of integer"
+    value: "3.14159"
+    description: "Float where integer expected"
+    category: boundary
+
+  - name: "Negative float"
+    value: "-0.001"
+    description: "Negative float"
+    category: boundary
+
+  - name: "Scientific notation"
+    value: "1e308"
+    description: "Scientific notation number"
+    category: boundary
+
+  - name: "NaN string"
+    value: "NaN"
+    description: "NaN as string"
+    category: boundary
+
+  - name: "Infinity"
+    value: "Infinity"
+    description: "Infinity string"
+    category: boundary
+
+date_attacks:
+  - name: "Past date"
+    value: "1900-01-01"
+    description: "Very old past date"
+    category: boundary
+
+  - name: "Future date - far"
+    value: "2099-12-31"
+    description: "Very far future date"
+    category: boundary
+
+  - name: "Invalid date"
+    value: "2024-13-45"
+    description: "Completely invalid date"
+    category: boundary
+
+  - name: "Date as string"
+    value: "not-a-date"
+    description: "String instead of date"
+    category: boundary
+
+  - name: "Unix timestamp"
+    value: "1609459200"
+    description: "Unix timestamp instead of formatted date"
+    category: boundary
+
+  - name: "SQL date injection"
+    value: "2024-01-01'; DROP TABLE events; --"
+    description: "SQL injection via date field"
+    category: security
+
+file_uploads:
+  - name: "Executable as image"
+    extension: ".exe"
+    mime_type: "image/jpeg"
+    description: "Upload .exe disguised as JPEG"
+    category: security
+
+  - name: "PHP as image"
+    extension: ".php"
+    mime_type: "image/png"
+    description: "Upload PHP file disguised as PNG"
+    category: security
+
+  - name: "JavaScript as image"
+    extension: ".js"
+    mime_type: "image/gif"
+    description: "Upload JS file disguised as GIF"
+    category: security
+
+  - name: "SVG with script"
+    extension: ".svg"
+    mime_type: "image/svg+xml"
+    content: "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+    description: "SVG with embedded JavaScript"
+    category: security
+
+  - name: "Empty file"
+    extension: ".txt"
+    mime_type: "text/plain"
+    content: ""
+    description: "Zero-byte empty file"
+    category: boundary
+
+  - name: "Very large file"
+    extension: ".txt"
+    mime_type: "text/plain"
+    size_mb: 100
+    description: "100MB file to test size limits"
+    category: boundary
+
+email_attacks:
+  - name: "Missing @ symbol"
+    value: "notanemail"
+    description: "String without @ symbol"
+    category: boundary
+
+  - name: "Missing domain"
+    value: "test@"
+    description: "Email without domain"
+    category: boundary
+
+  - name: "SQL in email"
+    value: "test'OR'1'='1@example.com"
+    description: "SQL injection in email field"
+    category: security
+
+  - name: "XSS in email"
+    value: "test+<script>alert(1)</script>@example.com"
+    description: "XSS in email field"
+    category: security
+
+  - name: "Long local part"
+    value: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com"
+    description: "Extremely long email local part"
+    category: boundary
+
+url_attacks:
+  - name: "JavaScript URL"
+    value: "javascript:alert(1)"
+    description: "JavaScript protocol in URL field"
+    category: security
+
+  - name: "Data URL"
+    value: "data:text/html,<script>alert(1)</script>"
+    description: "Data URI scheme"
+    category: security
+
+  - name: "Local file"
+    value: "file:///etc/passwd"
+    description: "Local file access attempt"
+    category: security
+
+  - name: "Internal network"
+    value: "http://localhost:8080/admin"
+    description: "SSRF via internal network"
+    category: security
+
+performance_thresholds:
+  page_load_max_seconds: 3.0
+  action_timeout_seconds: 10.0
+  network_timeout_seconds: 30.0
+
+bug_detection_rules:
+  http_error_codes: [400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504]
+  suspicious_console_keywords:
+    - "Uncaught"
+    - "TypeError"
+    - "ReferenceError"
+    - "SyntaxError"
+    - "NetworkError"
+    - "Failed to fetch"
+    - "CORS"
+    - "undefined is not"
+    - "Cannot read property"
+    - "null is not"
+  blank_page_indicators:
+    - ""
+    - "undefined"
+    - "null"
