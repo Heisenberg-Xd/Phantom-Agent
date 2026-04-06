@@ -75,13 +75,21 @@ class PhantomBrowser:
 
     async def start(self):
         """Launch browser and create context."""
+        PAGE_TIMEOUT = 8000
+        ACTION_TIMEOUT = 5000
+        
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless,
             args=[
+                "--disable-images",
+                "--disable-extensions", 
+                "--disable-background-networking",
+                "--disable-default-apps",
                 "--no-sandbox",
+                "--disable-gpu",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
+                "--blink-settings=imagesEnabled=false"
             ],
         )
         self._context = await self._browser.new_context(
@@ -93,7 +101,11 @@ class PhantomBrowser:
             ),
             java_script_enabled=True,
             ignore_https_errors=True,
+            bypass_csp=True,
         )
+        self._context.set_default_timeout(ACTION_TIMEOUT)
+        self._context.set_default_navigation_timeout(PAGE_TIMEOUT)
+        
         self._page = await self._context.new_page()
         self._attach_listeners()
         logger.info("Browser started successfully")
@@ -161,20 +173,17 @@ class PhantomBrowser:
             raise RuntimeError("Browser not started")
         return self._page
 
-    async def navigate(self, url: str, timeout: int = 30000, take_screenshot: bool = True) -> PageCapture:
+    async def navigate(self, url: str, timeout: int = 8000, take_screenshot: bool = True) -> PageCapture:
         """Navigate to URL and capture full page state."""
         self.clear_events()
         start = time.time()
 
         try:
-            await self._page.goto(url, wait_until="networkidle", timeout=timeout)
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=timeout)
         except Exception as e:
-            logger.warning(f"Navigation timeout/error for {url}: {e}")
-            # Still try to capture whatever loaded
-            try:
-                await self._page.wait_for_load_state("domcontentloaded", timeout=5000)
-            except Exception:
-                pass
+            logger.debug(f"Navigation error for {url}: {e}")
+            # Do not wait for load_state if goto failed fast
+            pass
 
         load_time = time.time() - start
         return await self._capture_page(url, load_time, take_screenshot)
@@ -304,6 +313,28 @@ class PhantomBrowser:
         except Exception as e:
             logger.debug(f"click_element({selector}) failed: {e}")
             return False
+
+    async def execute_login(self, login_steps: list):
+        """Execute explicit login steps before other tasks."""
+        if not self._page or not login_steps:
+            return
+        
+        logger.info(f"Executing {len(login_steps)} custom login steps...")
+        for step in login_steps:
+            try:
+                action = step.get("action")
+                if action == "goto":
+                    await self._page.goto(step.get("url"), timeout=15000)
+                elif action == "fill":
+                    await self._page.fill(step.get("selector"), step.get("value"))
+                elif action == "click":
+                    await self._page.click(step.get("selector"))
+                elif action == "wait":
+                    await asyncio.sleep(step.get("ms", 1000) / 1000.0)
+                elif action == "select":
+                    await self._page.select_option(step.get("selector"), step.get("value"))
+            except Exception as e:
+                logger.error(f"Login step failed ({step}): {e}")
 
     async def submit_form(
         self, form_selector: str = "form", timeout: int = 5000, take_screenshot: bool = True

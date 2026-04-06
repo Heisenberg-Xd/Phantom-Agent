@@ -18,7 +18,7 @@ from google import genai
 
 logger = logging.getLogger("phantom")
 
-MODEL = "gemini-1.5-flash"
+MODEL = "gemini-2.0-flash"
 
 
 def _make_client() -> genai.Client:
@@ -177,12 +177,12 @@ Return only the prompt text, nothing else."""
 
         report = []
         report.append("================================================================================")
-        report.append("   _____  _    _          _   _  _____  ____  __  __")
-        report.append("  |  __ \\| |  | |   /\\   | \\ | |  __  |/ __ \\|  \\/  |")
-        report.append("  | |__) | |__| |  /  \\  |  \\| | |  | | |  | | \\  / |")
-        report.append("  |  ___/|  __  | / /\\ \\ | . ` |  | | | |  | | |\\/| |")
-        report.append("  | |    | |  | |/ ____ \\| |\\  | |  | | |__| | |  | |")
-        report.append("  |_|    |_|  |_/_/    \\_\\_| \\_|  |_|  \\____/|_|  |_|")
+        report.append("██████╗ ██╗  ██╗ █████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ███╗")
+        report.append("██╔══██╗██║  ██║██╔══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗ ████║")
+        report.append("██████╔╝███████║███████║██╔██╗ ██║   ██║   ██║   ██║██╔████╔██║")
+        report.append("██╔═══╝ ██╔══██║██╔══██║██║╚██╗██║   ██║   ██║   ██║██║╚██╔╝██║")
+        report.append("██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║")
+        report.append("╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝")
         report.append("")
         report.append("                   A U T O N O M O U S   Q A   A G E N T")
         report.append("================================================================================")
@@ -224,6 +224,19 @@ Return only the prompt text, nothing else."""
         report.append("")
         report.append("")
         report.append("================================================================================")
+        report.append("  JOURNEYS EXECUTED")
+        report.append("================================================================================")
+        report.append("")
+        if not journeys:
+            report.append("  [*] No journeys executed.")
+        else:
+            for idx, j in enumerate(journeys, start=1):
+                name = j.get("name", "Unknown Journey")
+                status = "FAILED" if j.get("failed") else "PASSED"
+                report.append(f"  #{idx:03d}  {name:<25} — {status}")
+        report.append("")
+        report.append("")
+        report.append("================================================================================")
         report.append("  BUGS FOUND")
         report.append("================================================================================")
         report.append("")
@@ -235,10 +248,15 @@ Return only the prompt text, nothing else."""
             for idx, bug in enumerate(bug_reports, start=1):
                 sev = bug.get("severity", "low").upper()
                 cat = bug.get("category", "unknown")
-                report.append(f"  #{idx:03d}  {sev}  {cat}")
+                title = pad_lines(bug.get('title', 'Unknown'))
+                report.append(f"  #{idx:03d}  {sev}  {title}")
                 report.append("  -----------------------------------------------------------------------")
-                report.append(f"  Title    : {pad_lines(bug.get('title', 'Unknown'))}")
-                report.append(f"  URL      : {pad_lines(bug.get('affected_url', url))}")
+                urls = bug.get('affected_urls', [])
+                if not urls:
+                    urls = [bug.get('affected_url', url)]
+                report.append(f"        Affected URLs: {len(urls)}")
+                for u in urls:
+                    report.append(f"        - {u}")
                 report.append(f"  Steps    : {pad_lines(bug.get('steps_to_reproduce', []))}")
                 report.append(f"  Expected : {pad_lines(bug.get('expected_behavior', ''))}")
                 report.append(f"  Actual   : {pad_lines(bug.get('actual_behavior', ''))}")

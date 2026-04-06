@@ -17,7 +17,7 @@ from google.genai import types
 
 logger = logging.getLogger("phantom")
 
-MODEL = "gemini-1.5-flash"
+MODEL = "gemini-2.0-flash"
 WAIT_TIMES = [2, 4, 8, 16, 32]
 
 

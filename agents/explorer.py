@@ -290,6 +290,7 @@ class ExplorerAgent:
         screenshots_dir: Path,
         headless: bool = True,
         credentials: dict = None,
+        login_steps: list = None,
     ):
         self.base_url = base_url
         self.base_domain = urlparse(base_url).netloc
@@ -298,6 +299,7 @@ class ExplorerAgent:
         self.screenshots_dir = screenshots_dir
         self.headless = headless
         self.credentials = credentials
+        self.login_steps = login_steps
         self.flagged_events: list[FlaggedEvent] = []
 
     async def explore(self) -> list:
@@ -332,6 +334,9 @@ class ExplorerAgent:
     async def _run_exploration(self):
         """Run all exploration phases."""
         async with PhantomBrowser(self.screenshots_dir, headless=self.headless) as browser:
+            if self.login_steps:
+                await browser.execute_login(self.login_steps)
+
             # Phase A: probe every discovered page FIRST (always runs)
             logger.info(f"Explorer probing {len(self.pages)} pages...")
             for page_info in self.pages:
@@ -339,25 +344,26 @@ class ExplorerAgent:
                 if url:
                     await self._probe_page(browser, url)
 
-            # Phase B: attempt login if login page detected (runs after probing)
-            login_pages = [
-                p for p in self.pages
-                if any(kw in p.get("url", "").lower() for kw in ["login", "signin", "auth"])
-                or any(kw in p.get("title", "").lower() for kw in ["login", "sign in"])
-            ]
-            logged_in = False
-            if login_pages or self.credentials:
-                logger.info("Login page detected — attempting login (max 30s)...")
-                try:
-                    logged_in = await asyncio.wait_for(
-                        handle_login(browser.page, self.base_url, self.credentials),
-                        timeout=30,
-                    )
-                    logger.info(f"Login result: {'success' if logged_in else 'failed/not available'}")
-                except asyncio.TimeoutError:
-                    logger.info("Login handler timed out after 30s")
-                except Exception as e:
-                    logger.error(f"Login handler error: {e}")
+            # Phase B: attempt login if login page detected (runs after probing unless login_steps was used)
+            if not self.login_steps:
+                login_pages = [
+                    p for p in self.pages
+                    if any(kw in p.get("url", "").lower() for kw in ["login", "signin", "auth"])
+                    or any(kw in p.get("title", "").lower() for kw in ["login", "sign in"])
+                ]
+                logged_in = False
+                if login_pages or self.credentials:
+                    logger.info("Login page detected — attempting login (max 30s)...")
+                    try:
+                        logged_in = await asyncio.wait_for(
+                            handle_login(browser.page, self.base_url, self.credentials),
+                            timeout=30,
+                        )
+                        logger.info(f"Login result: {'success' if logged_in else 'failed/not available'}")
+                    except asyncio.TimeoutError:
+                        logger.info("Login handler timed out after 30s")
+                    except Exception as e:
+                        logger.error(f"Login handler error: {e}")
 
             # The journeys will be loaded from app_model.json after edge case testing
 
@@ -390,30 +396,22 @@ class ExplorerAgent:
                     except Exception as e:
                         logger.error(f"File upload test error on {url}: {e}")
 
-            # load journeys from app model
-            app_model_path = Path("memory/app_model.json")
-            if app_model_path.exists():
-                logger.info("Loading journeys from app_model.json...")
-                try:
-                    import json
-                    with open(app_model_path) as f:
-                        app_model = json.load(f)
-                    journeys = app_model.get("journeys", [])
-                    logger.info(f"Loaded {len(journeys)} journeys from model.")
-                    
-                    for journey in journeys:
-                        result = await self._execute_journey(browser, journey)
-                        if result and result.get("failed"):
-                            await self._flag(browser, FlaggedEvent(
-                                event_type="journey_failure",
-                                severity_hint="medium",
-                                url=result.get("url", ""),
-                                description=f"Journey '{journey.get('name', 'Unknown')}' failed at step: {result.get('failed_step')}",
-                                screenshot_path=result.get("screenshot", ""),
-                                steps_taken=[f"Executing journey '{journey.get('name', 'Unknown')}'", f"Failed step: {result.get('failed_step')}"]
-                            ))
-                except Exception as e:
-                    logger.error(f"Error loading/executing journeys from app_model: {e}")
+            # execute journeys
+            logger.info(f"Executing {len(self.journeys)} journeys...")
+            for journey in self.journeys:
+                result = await self._execute_journey(browser, journey)
+                if result and result.get("failed"):
+                    journey["failed"] = True
+                    await self._flag(browser, FlaggedEvent(
+                        event_type="journey_failure",
+                        severity_hint="medium",
+                        url=result.get("url", ""),
+                        description=f"Journey '{journey.get('name', 'Unknown')}' failed at step: {result.get('failed_step')}",
+                        screenshot_path=result.get("screenshot", ""),
+                        steps_taken=[f"Executing journey '{journey.get('name', 'Unknown')}'", f"Failed step: {result.get('failed_step')}"]
+                    ))
+                else:
+                    journey["failed"] = False
 
         logger.info(f"Explorer complete. {len(self.flagged_events)} events flagged.")
 
@@ -484,8 +482,76 @@ class ExplorerAgent:
         except Exception as e:
             logger.error(f"_probe_page error for {url}: {e}")
 
+async def journey_login(page):
+    await page.goto("https://demo.testfire.net/login.jsp")
+    await page.fill("#uid", "admin")
+    await page.fill("#passw", "admin")
+    await page.click("[type=submit]")
+    await page.wait_for_timeout(2000)
+    
+    # Verify login succeeded
+    current_url = page.url
+    if "main.jsp" in current_url or "bank" in current_url:
+        return {"status": "PASSED", "reached": current_url}
+    else:
+        return {"status": "FAILED", 
+                "reason": "Did not reach dashboard after login"}
+
+async def journey_view_account(page):
+    # Login first
+    await journey_login(page)
+    
+    # Navigate to account
+    await page.goto(
+        "https://demo.testfire.net/bank/main.jsp"
+    )
+    await page.wait_for_timeout(1000)
+    
+    content = await page.content()
+    if "account" in content.lower():
+        return {"status": "PASSED"}
+    return {"status": "FAILED", 
+            "reason": "Account page not accessible"}
+
+async def journey_transfer(page):
+    await journey_login(page)
+    await page.goto(
+        "https://demo.testfire.net/bank/transfer.jsp"
+    )
+    await page.wait_for_timeout(1000)
+    
+    # Try a transfer
+    try:
+        await page.select_option(
+            "select[name='fromAccount']", index=0
+        )
+        await page.select_option(
+            "select[name='toAccount']", index=1
+        )
+        await page.fill(
+            "input[name='transferAmount']", "100"
+        )
+        await page.click("[type=submit]")
+        await page.wait_for_timeout(2000)
+        
+        content = await page.content()
+        if "error" in content.lower():
+            return {"status": "FAILED", 
+                    "reason": "Transfer returned error"}
+        return {"status": "PASSED"}
+    except Exception as e:
+        return {"status": "FAILED", "reason": str(e)}
+
     async def _execute_journey(self, browser: PhantomBrowser, journey: dict) -> dict:
         """Execute a single user journey using smart element finder."""
+        hardcoded = journey.get("hardcoded")
+        if hardcoded == "journey_login":
+            return await journey_login(browser.page)
+        elif hardcoded == "journey_view_account":
+            return await journey_view_account(browser.page)
+        elif hardcoded == "journey_transfer":
+            return await journey_transfer(browser.page)
+
         steps = journey.get("steps", [])
         pages_involved = journey.get("pages_involved", [self.base_url])
         name = journey.get("name", "Unknown Journey")
@@ -556,10 +622,11 @@ class ExplorerAgent:
                     "failed": True,
                     "failed_step": f"{action} on '{selector}'",
                     "url": browser.page.url,
-                    "screenshot": shot_path
+                    "screenshot": shot_path,
+                    "reason": str(e)
                 }
                 
-        return {"failed": False}
+        return {"status": "PASSED"}
 
     async def _fuzz_forms(self, browser: PhantomBrowser, url: str, forms: list):
         """Fuzz forms with security-relevant inputs only."""
@@ -584,7 +651,8 @@ class ExplorerAgent:
 
             for attack in security_payloads:
                 try:
-                    await browser.navigate(url, timeout=10000, take_screenshot=False)
+                    t = time.time()
+                    await browser.navigate(url, timeout=8000, take_screenshot=False)
                     browser.clear_events()
 
                     form_filled = False
@@ -625,16 +693,23 @@ class ExplorerAgent:
                         for kw in ["error", "invalid", "required", "warning", "validation", "rejected"]
                     )
 
-                    if (url_changed or len(content) > 100) and no_error and attack["category"] == "security":
-                        await self._flag(browser, FlaggedEvent(
-                            event_type="invalid_input",
-                            severity_hint="high",
-                            url=url,
-                            description=f"Form accepted security payload '{attack['name']}' without validation",
-                            screenshot_path=capture.screenshot_path,
-                            steps_taken=[f"Navigate to {url}", f"Fill form with {attack['name']}", "Submit"],
-                            edge_case_used=attack["name"],
-                        ))
+                    if attack["category"] == "security":
+                        is_vuln = await self._verify_injection(browser.page, attack["input_type"])
+                        if is_vuln:
+                            await self._flag(browser, FlaggedEvent(
+                                event_type="invalid_input",
+                                severity_hint="high",
+                                url=url,
+                                description=f"Form accepted security payload '{attack['name']}' without validation",
+                                screenshot_path=capture.screenshot_path,
+                                steps_taken=[f"Navigate to {url}", f"Fill form with {attack['name']}", "Submit"],
+                                edge_case_used=attack["name"],
+                            ))
+                        elif no_error and (url_changed or len(content) > 100):
+                            pass  # Discard if it's security related but no hard evidence
+
+                    elif (url_changed or len(content) > 100) and no_error and attack["category"] == "validation":
+                        pass # discard
 
                     # Check for 5xx after submit
                     for ne in capture.network_events:
@@ -650,7 +725,8 @@ class ExplorerAgent:
                                 edge_case_used=attack["name"],
                             ))
 
-                    await asyncio.sleep(0.5)  # small sleep inside browser loop
+                    logger.info(f"ADVERSARIAL: {time.time() - t:.1f}s for {attack['name']} on {url}")
+                    await asyncio.sleep(0.5)  # Add delay to prevent DOS-ing the server
 
                 except Exception as e:
                     logger.debug(f"Form attack error ({attack['name']} on {url}): {e}")
@@ -683,3 +759,30 @@ class ExplorerAgent:
             f"BUG FLAGGED [{event.severity_hint.upper()}] "
             f"{event.event_type}: {event.description[:80]}"
         )
+
+    async def _verify_injection(self, page, payload_type: str) -> bool:
+        """Check for actual SQL/XSS error messages."""
+        try:
+            content = (await page.content()).lower()
+            
+            sql_error_signs = [
+                "sql syntax", "mysql_fetch", "ora-", 
+                "sqlite", "pg_query", "sqlstate",
+                "unclosed quotation", "syntax error"
+            ]
+            
+            xss_error_signs = [
+                "<script>", "alert(", "onerror=",
+                "javascript:"
+            ]
+            
+            if payload_type == "sql_injection":
+                return any(s in content for s in sql_error_signs)
+            
+            if payload_type == "xss":
+                return any(s in content for s in xss_error_signs)
+                
+        except Exception as e:
+            logger.debug(f"verify_injection error: {e}")
+            
+        return False

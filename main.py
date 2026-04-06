@@ -78,7 +78,7 @@ def print_banner():
     console.print(
         Panel.fit(
             "[bold magenta]👻  P H A N T O M[/bold magenta]\n"
-            "[dim]Autonomous QA Agent — powered by Gemini[/dim]",
+            "[dim]Autonomous QA Agent — powered by ImagineX[/dim]",
             border_style="magenta",
             padding=(1, 4),
         )
@@ -162,6 +162,62 @@ def cleanup_old_scans(project_dir: Path, max_scans: int = 10):
                 logger.error(f"Failed to delete old scan folder {old_scan}: {e}")
 
 
+def should_report_bug(bug) -> bool:
+    
+    actual = bug.get("actual_behavior", "").lower()
+    title = bug.get("title", "").lower()
+    
+    # Hard discard phrases — any match = throw away
+    discard_phrases = [
+        "no hard evidence",
+        "but no hard evidence",
+        "could not confirm",
+        "no evidence",
+        "submitted payload",      # means unconfirmed
+        "without validation",     # too generic, unconfirmed
+    ]
+    
+    for phrase in discard_phrases:
+        if phrase in actual or phrase in title:
+            return False
+    
+    # Must have confirmed evidence field
+    evidence = bug.get("evidence", {})
+    if not evidence.get("confirmed", False):
+        # Only allow medium/low through without 
+        # confirmation if they have a different 
+        # detection method (e.g. slow page timer)
+        if bug.get("raw_event_type") not in [
+            "slow_page", "console_error", 
+            "broken_link", "http_error"
+        ]:
+            return False
+    
+    return True
+
+def deduplicate_bugs(bugs):
+    groups = {}
+    for bug in bugs:
+        key = bug.get("raw_event_type") or bug.get("category", "unknown")
+        if key not in groups:
+            groups[key] = {
+                "title": bug.get("title", "Unknown"),
+                "severity": bug.get("severity", "low"),
+                "type": key,
+                "category": bug.get("category", "unknown"),
+                "affected_urls": [],
+                "steps_to_reproduce": bug.get("steps_to_reproduce", []),
+                "expected_behavior": bug.get("expected_behavior", ""),
+                "actual_behavior": bug.get("actual_behavior", ""),
+                "suggested_fix": bug.get("suggested_fix", ""),
+                "screenshot_path": bug.get("screenshot_path", "")
+            }
+        url = bug.get("affected_url") or bug.get("url")
+        if url and url not in groups[key]["affected_urls"]:
+            groups[key]["affected_urls"].append(url)
+    return list(groups.values())
+
+
 # ── Core async pipeline ───────────────────────────────────────────────────────
 
 async def run_pipeline(
@@ -172,6 +228,7 @@ async def run_pipeline(
     max_pages: int = 8,
     headless: bool = True,
     credentials: dict = None,
+    login_steps: list = None,
 ) -> list:
     """
     Clean one-way async pipeline. Every phase returns its data explicitly.
@@ -188,6 +245,8 @@ async def run_pipeline(
     screenshots_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Phase 1: Crawl ────────────────────────────────────────────────────────
+    import time
+    t0 = time.time()
     console.print("  [Phase 1]  Crawling.............. ", end="")
     try:
         crawler = CrawlerAgent(
@@ -196,11 +255,12 @@ async def run_pipeline(
             max_pages=max_pages,
             screenshots_dir=screenshots_dir,
             headless=headless,
+            login_steps=login_steps,
         )
         pages = await crawler.crawl()
         assert isinstance(pages, list), "Crawler must return a list"
         assert len(pages) > 0, f"Crawler returned 0 pages for {url}"
-        console.print(f"done   {len(pages)} pages")
+        console.print(f"done   {len(pages)} pages ({time.time()-t0:.1f}s)")
     except AssertionError as e:
         console.print(f"[red]FAILED[/red]   {e}")
         logger.error(f"Phase 1 assertion: {e}")
@@ -219,6 +279,7 @@ async def run_pipeline(
         logger.error(f"build_journeys failed: {e}")
 
     # ── Phase 2: Explore ──────────────────────────────────────────────────────
+    t0 = time.time()
     console.print("  [Phase 2]  Exploring............. ", end="")
     try:
         explorer = ExplorerAgent(
@@ -228,10 +289,11 @@ async def run_pipeline(
             screenshots_dir=screenshots_dir,
             headless=headless,
             credentials=credentials,
+            login_steps=login_steps,
         )
         events = await explorer.explore()
         assert isinstance(events, list), "Explorer must return a list"
-        console.print(f"done   {len(events)} events")
+        console.print(f"done   {len(events)} events ({time.time()-t0:.1f}s)")
     except AssertionError as e:
         console.print(f"[red]FAILED[/red]   {e}")
         logger.error(f"Phase 2 assertion: {e}")
@@ -241,13 +303,45 @@ async def run_pipeline(
         logger.error(f"Phase 2 explore error: {e}")
         events = []
 
+    # ── Phase 2b: Security Tests ──────────────────────────────────────────────
+    import time
+    t0 = time.time()
+    console.print("  [Phase 2b] Security Tests......... ", end="")
+    try:
+        from agents.security import SecurityAgent
+        security = SecurityAgent(
+            base_url=url,
+            pages=pages,
+            screenshots_dir=screenshots_dir,
+            headless=headless,
+            login_steps=login_steps,
+        )
+        security_bugs = await security.run_all()
+        console.print(f"done   {len(security_bugs)} bugs ({time.time()-t0:.1f}s)")
+    except Exception as e:
+        console.print(f"[red]ERROR[/red]")
+        logger.error(f"Phase 2b security error: {e}")
+        security_bugs = []
+
     # ── Phase 3: Validate ─────────────────────────────────────────────────────
+    import time
+    t0 = time.time()
     console.print("  [Phase 3]  Validating............ ", end="")
+    bug_reports = []
     try:
         validator = ValidatorAgent(screenshots_dir=screenshots_dir)
-        bug_reports = await validator.validate_all(events)
+        raw_reports = await validator.validate_all(events)
+        all_bugs = [b for b in raw_reports if b is not None] + security_bugs
+        
+        # Apply the final gate before any deduplication or reporting
+        bugs_to_report = [b for b in all_bugs if should_report_bug(b)]
+        
+        if len(bugs_to_report) == 0:
+            console.print("No confirmed bugs found in this scan.")
+        
+        bug_reports = deduplicate_bugs(bugs_to_report)
         assert isinstance(bug_reports, list), "Validator must return a list"
-        console.print(f"done   {len(bug_reports)} bugs")
+        console.print(f"done   {len(bug_reports)} bugs ({time.time()-t0:.1f}s)")
     except AssertionError as e:
         console.print(f"[red]FAILED[/red]   {e}")
         logger.error(f"Phase 3 assertion: {e}")
@@ -288,7 +382,7 @@ async def run_pipeline(
                 actual_behavior=report.get("actual_behavior", ""),
                 suggested_fix=report.get("suggested_fix", ""),
                 screenshot_path=report.get("screenshot_path", ""),
-                page_url=report.get("affected_url", ""),
+                page_url=report.get("affected_urls", [""])[0] if report.get("affected_urls") else "",
             )
         regression = await memory.compute_regression_delta(url, scan_id, bug_titles)
         await memory.update_scan_stats(
@@ -346,6 +440,7 @@ def scan(
     deep: bool = typer.Option(False, "--deep", help="Run full scan instead of fast"),
     headless: bool = typer.Option(True, "--headless/--no-headless", help="Run browser headlessly"),
     credentials_json: str = typer.Option(None, "--credentials", help='JSON credentials e.g. \'{"email":"x@x.com","password":"123"}\''),
+    login_steps: str = typer.Option(None, "--login-steps", help='JSON array of login steps'),
 ):
     """
     👻 Run Phantom QA scan on a web application.
@@ -371,6 +466,13 @@ def scan(
         except Exception:
             console.print("[yellow]⚠ Could not parse --credentials JSON. Proceeding without credentials.[/yellow]")
 
+    login_steps_parsed = None
+    if login_steps:
+        try:
+            login_steps_parsed = json.loads(login_steps)
+        except Exception:
+            console.print("[yellow]⚠ Could not parse --login-steps JSON. Proceeding without steps.[/yellow]")
+
     print_banner()
     console.print(f"[bold]🎯 Target:[/bold] {url}")
     console.print(f"[bold]📋 Description:[/bold] {description}")
@@ -390,6 +492,7 @@ def scan(
             max_pages=max_pages,
             headless=headless,
             credentials=credentials,
+            login_steps=login_steps_parsed,
         )
     )
 
