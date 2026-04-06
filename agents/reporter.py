@@ -1,6 +1,7 @@
 """
-Reporter agent — Phase 3b.
-Generates the final summary.md and regression delta report.
+Reporter agent — Phase 3b & 5.
+Generates fix prompts and the final report.md.
+url is passed directly — never falls back to "Unknown".
 """
 
 import asyncio
@@ -17,54 +18,34 @@ from google import genai
 
 logger = logging.getLogger("phantom")
 
+MODEL = "gemini-1.5-flash"
+
+
 def _make_client() -> genai.Client:
     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-MODEL = "gemini-1.5-flash"
-
-REPORTS_DIR = Path("reports")
-SUMMARY_PATH = REPORTS_DIR / "summary.md"
-
 
 class ReporterAgent:
-    """Generates the final markdown summary report and fix prompts."""
-    
+    """Generates fix prompts and the final markdown report."""
+
     def __init__(self, reports_dir: Path = Path("reports")):
-        self.reports_dir = reports_dir
+        self.reports_dir = Path(reports_dir)
 
-    def _find_related_files(self, title: str) -> list[str]:
-        words = re.findall(r'[a-zA-Z]{3,}', title.lower())
-        noise = {'error', 'failed', 'issue', 'found', 'console', 'bug', 'the', 'and', 'with', 'for'}
-        keywords = [w for w in words if w not in noise]
-        
-        if not keywords:
-            return []
+    # ── Fix prompts ───────────────────────────────────────────────────────────
 
-        root = Path(".")
-        exclude_dirs = {"node_modules", ".git", "venv", "__pycache__", "reports", "memory", ".gemini"}
-        
-        matched_files = []
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            if any(part in exclude_dirs for part in path.parts):
-                continue
-                
-            path_str = str(path).lower()
-            score = sum(1 for kw in keywords if kw in path_str)
-            if score > 0:
-                matched_files.append((score, str(path)))
-                
-        matched_files.sort(key=lambda x: x[0], reverse=True)
-        return [f[1] for f in matched_files[:3]]
-
-    async def generate_fix_prompts(self, bug_reports: list[dict], progress_callback=None) -> list[tuple[str, str]]:
+    async def generate_fix_prompts(self, bug_reports: list) -> list:
+        """
+        Generate one fix prompt file per bug report.
+        Returns list of tuples: (relative_path, severity).
+        """
         client = _make_client()
         generated_prompts = []
-        
+
+        fix_prompts_dir = self.reports_dir / "fix_prompts"
+        fix_prompts_dir.mkdir(parents=True, exist_ok=True)
+
         for idx, report in enumerate(bug_reports, start=1):
             bug_id = f"{idx:03d}"
-            
             title = report.get("title", "Unknown Bug")
             severity = report.get("severity", "low").upper()
             steps_list = report.get("steps_to_reproduce", [])
@@ -72,59 +53,53 @@ class ReporterAgent:
             expected = report.get("expected_behavior", "")
             actual = report.get("actual_behavior", "")
             affected_url = report.get("affected_url", "")
-            screenshot_path = report.get("screenshot_path", "")
-            if not screenshot_path:
-                screenshot_path = "No screenshot available."
+            screenshot_path = report.get("screenshot_path", "No screenshot available.")
+            existing_fix = report.get("suggested_fix", "")
 
-            if progress_callback:
-                progress_callback(f"Generating fix prompt [{idx}/{len(bug_reports)}]: {title[:40]}")
-
-            related_files = self._find_related_files(title)
-            
             prompt = f"""You are a senior developer writing a prompt that another AI coding agent will use to fix a bug.
 
 Bug Report:
 - Title: {title}
 - Severity: {severity}
-- Steps to reproduce: {steps}
+- Steps to reproduce:
+{steps}
 - Expected: {expected}
 - Actual: {actual}
 - Affected URL: {affected_url}
+- Suggested Fix: {existing_fix}
 
-Write a precise, copy-paste ready prompt that:
+Write a precise, copy-paste ready prompt (under 300 words) that:
 1. Explains the bug clearly with full context
 2. Lists the exact steps to reproduce
 3. States what the correct behavior should be
-4. Asks the AI to find the root cause and fix it
-5. Asks the AI to make sure the fix doesn't break related functionality
+4. Asks the AI to find the root cause and fix it specifically
+5. Names the file type, function, or config that likely needs changing
+6. Asks the AI to verify the fix doesn't break related functionality
 
-Keep it under 300 words. Be specific, not generic. Return only the prompt text, nothing else."""
+Be specific and technical. Never write generic advice.
+Return only the prompt text, nothing else."""
 
-            generated_text = "Failed to generate prompt due to API error."
-            for attempt in range(5):
+            generated_text = f"Fix the following bug:\n\nTitle: {title}\nSeverity: {severity}\nURL: {affected_url}\n\nSteps:\n{steps}\n\nExpected: {expected}\nActual: {actual}\n\nSuggested approach: {existing_fix}"
+
+            for attempt in range(3):
                 try:
-                    logger.info(f"Gemini fix prompt (attempt {attempt+1}/5): {title[:50]}")
+                    logger.info(f"Gemini fix prompt (attempt {attempt+1}/3): {title[:50]}")
                     loop = asyncio.get_event_loop()
                     response = await loop.run_in_executor(
                         None,
-                        lambda p=prompt: client.models.generate_content(
+                        lambda p=prompt: _make_client().models.generate_content(
                             model=MODEL, contents=p
                         ),
                     )
-                    
                     generated_text = response.text.strip()
                     break
                 except Exception as e:
-                    logger.warning(f"Generating fix prompt failed (attempt {attempt+1}): {e}")
-                    if attempt < 4:
+                    logger.warning(f"Fix prompt generation failed (attempt {attempt+1}): {e}")
+                    if attempt < 2:
                         await asyncio.sleep(5)
-            
-            self.reports_dir.mkdir(parents=True, exist_ok=True)
-            fix_prompts_dir = self.reports_dir / "fix_prompts"
-            fix_prompts_dir.mkdir(parents=True, exist_ok=True)
-            
+
+            # Write the fix prompt file
             prompt_filename = fix_prompts_dir / f"fix_prompt_{bug_id}.md"
-            
             md_lines = [
                 "---",
                 f"# Fix Prompt — {title}",
@@ -134,65 +109,51 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
                 "## Prompt (copy and paste this into your AI coding agent)",
                 "",
                 generated_text,
-                ""
+                "",
+                "## Screenshot",
+                str(screenshot_path),
+                "---",
+                "",
             ]
-            
-            if related_files:
-                md_lines.append("## Related Files Found")
-                for fpath in related_files:
-                    md_lines.append(f"- `{fpath}`")
-                md_lines.append("")
-                
-            md_lines.append("## Screenshot")
-            md_lines.append(str(screenshot_path))
-            md_lines.append("---")
-            md_lines.append("")
-            
             prompt_filename.write_text("\n".join(md_lines), encoding="utf-8")
-            
-            # Since fix prompts exist in a subdirectory relative to report.md,
-            # we just append a relative string like 'fix_prompts/fix_prompt_001.md'
-            # to make the output format exactly as the user specified.
+
             generated_prompts.append((f"fix_prompts/fix_prompt_{bug_id}.md", severity))
-            
             await asyncio.sleep(4)
-            
+
         return generated_prompts
 
-    def generate_summary(
-        self,
-        project_name: str,
-        bug_reports: list[dict],
-        app_model: dict,
-        regression_delta: dict,
-        fix_prompts: list,
-        scan_start_time: datetime,
-        scan_end_time: datetime,
-    ) -> str:
-        """Generate and save report.md using pure ASCII formatting."""
+    # ── Report writer — url passed directly, no "Unknown" fallback ───────────
 
+    def write_report(
+        self,
+        url: str,
+        name: str,
+        pages: list,
+        bug_reports: list,
+        fix_prompts: list,
+        regression: dict,
+        journeys: list,
+        duration: float,
+        scan_start: datetime,
+    ) -> str:
+        """
+        Generate and save report.md.
+        url is always the actual target URL — never "Unknown".
+        """
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         summary_path = self.reports_dir / "report.md"
 
-        duration_sec = (scan_end_time - scan_start_time).total_seconds()
-        duration_fmt = f"{duration_sec:.0f}"
-        scan_date_fmt = scan_start_time.strftime("%Y-%m-%d %H:%M:%S UTC")
-        
-        journeys = app_model.get("journeys", [])
-        crawled_urls = app_model.get("crawled_urls", [])
-        graph_nodes = app_model.get("interaction_graph", {}).get("nodes", [])
-        base_url = app_model.get("base_url", "Unknown")
+        scan_date_fmt = scan_start.strftime("%Y-%m-%d %H:%M:%S UTC")
+        duration_fmt = f"{duration:.0f}"
 
         total_bugs = len(bug_reports)
-        visited_count = len(crawled_urls)
-        total_discovered = len(graph_nodes) if graph_nodes else visited_count
-        coverage_pct = round((visited_count / total_discovered) * 100) if total_discovered > 0 else 0
+        visited_count = len(pages)
+        journeys_count = len(journeys)
+        coverage_pct = min(round((visited_count / max(8, 1)) * 100), 100)
         cov_str = f"{coverage_pct}%"
 
-        # Count severities
-        from collections import Counter
         severity_counter = Counter(r.get("severity", "low").lower() for r in bug_reports)
-        
+
         def bar(sev):
             count = severity_counter.get(sev, 0)
             if total_bugs == 0:
@@ -202,31 +163,35 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
             return ("█" * filled) + ("░" * (10 - filled))
 
         def pad_lines(text, pad="             "):
-            if not text: return "None"
+            if not text:
+                return "None"
             if isinstance(text, list):
-                if not text: return "None"
+                if not text:
+                    return "None"
                 lines = [f"{i+1}. {s}" for i, s in enumerate(text)]
             else:
                 lines = str(text).split("\n")
-            if not lines: return "None"
+            if not lines:
+                return "None"
             return lines[0] + "".join("\n" + pad + line for line in lines[1:])
 
         report = []
         report.append("================================================================================")
-        report.append("    ____  __  _____    _    _   _ _______ ____  __  __")
-        report.append(r"   |  _ \|  || ___ \  / \  | \ | |__   __|  _ \|  \/  |")
-        report.append(r"   | |_) | |_| |_/ / / _ \ |  \| |  | |  | |_) | |\/| |")
-        report.append(r"   |  __/|  _|  _ < / ___ \| |\  |  | |  |  _ <| |  | |")
-        report.append(r"   |_|   |_| |_| \_/_/   \_|_| \_|  |_|  |_| \_|_|  |_|")
+        report.append("   _____  _    _          _   _  _____  ____  __  __")
+        report.append("  |  __ \\| |  | |   /\\   | \\ | |  __  |/ __ \\|  \\/  |")
+        report.append("  | |__) | |__| |  /  \\  |  \\| | |  | | |  | | \\  / |")
+        report.append("  |  ___/|  __  | / /\\ \\ | . ` |  | | | |  | | |\\/| |")
+        report.append("  | |    | |  | |/ ____ \\| |\\  | |  | | |__| | |  | |")
+        report.append("  |_|    |_|  |_/_/    \\_\\_| \\_|  |_|  \\____/|_|  |_|")
         report.append("")
         report.append("                   A U T O N O M O U S   Q A   A G E N T")
         report.append("================================================================================")
         report.append("")
-        report.append(f"  Project   : {project_name}")
-        report.append(f"  Target    : {base_url}")
+        report.append(f"  Project   : {name}")
+        report.append(f"  Target    : {url}")          # ← always real URL, never Unknown
         report.append(f"  Scan Date : {scan_date_fmt}")
         report.append(f"  Duration  : {duration_fmt}s")
-        report.append("  Generated : Phantom QA Agent v1.0")
+        report.append("  Generated : Phantom QA Agent v2.0")
         report.append("")
         report.append("================================================================================")
         report.append("  SCAN SUMMARY")
@@ -235,7 +200,7 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
         report.append("  +-------------+----------+---------------+-----------+----------+")
         report.append("  | Bugs Found  | Journeys | Pages Visited | Coverage  | Duration |")
         report.append("  +-------------+----------+---------------+-----------+----------+")
-        report.append(f"  | {total_bugs:^11} | {len(journeys):^8} | {visited_count:^13} | {cov_str:^9} | {duration_fmt+'s':^8} |")
+        report.append(f"  | {total_bugs:^11} | {journeys_count:^8} | {visited_count:^13} | {cov_str:^9} | {duration_fmt+'s':^8} |")
         report.append("  +-------------+----------+---------------+-----------+----------+")
         report.append("")
         report.append("  Severity Breakdown")
@@ -247,10 +212,22 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
         report.append("")
         report.append("")
         report.append("================================================================================")
+        report.append("  PAGES VISITED")
+        report.append("================================================================================")
+        report.append("")
+        for i, page in enumerate(pages, 1):
+            page_url = page.get("url", "") if isinstance(page, dict) else str(page)
+            page_title = page.get("title", "") if isinstance(page, dict) else ""
+            report.append(f"  {i:02d}. {page_url}")
+            if page_title:
+                report.append(f"       Title: {page_title}")
+        report.append("")
+        report.append("")
+        report.append("================================================================================")
         report.append("  BUGS FOUND")
         report.append("================================================================================")
         report.append("")
-        
+
         if not bug_reports:
             report.append("  [*] No bugs found during this scan.")
             report.append("")
@@ -258,11 +235,10 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
             for idx, bug in enumerate(bug_reports, start=1):
                 sev = bug.get("severity", "low").upper()
                 cat = bug.get("category", "unknown")
-                # Title padding logic to handle multiline safely though title is usually 1 line
                 report.append(f"  #{idx:03d}  {sev}  {cat}")
                 report.append("  -----------------------------------------------------------------------")
                 report.append(f"  Title    : {pad_lines(bug.get('title', 'Unknown'))}")
-                report.append(f"  URL      : {pad_lines(bug.get('affected_url', ''))}")
+                report.append(f"  URL      : {pad_lines(bug.get('affected_url', url))}")
                 report.append(f"  Steps    : {pad_lines(bug.get('steps_to_reproduce', []))}")
                 report.append(f"  Expected : {pad_lines(bug.get('expected_behavior', ''))}")
                 report.append(f"  Actual   : {pad_lines(bug.get('actual_behavior', ''))}")
@@ -275,10 +251,10 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
         report.append("  REGRESSION DELTA")
         report.append("================================================================================")
         report.append("")
-        
-        regressions = regression_delta.get("regressions", [])
-        fixed = regression_delta.get("fixed", [])
-        
+
+        regressions = regression.get("regressions", []) if regression else []
+        fixed = regression.get("fixed", []) if regression else []
+
         report.append("  Regressions (bugs that came back)")
         report.append("  ----------------------------------")
         if regressions:
@@ -287,7 +263,7 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
         else:
             report.append("  [*] No regressions detected")
         report.append("")
-        
+
         report.append("  Fixed Since Last Scan")
         report.append("  ----------------------")
         if fixed:
@@ -297,7 +273,7 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
             report.append("  [*] No verified fixes")
         report.append("")
         report.append("")
-        
+
         report.append("================================================================================")
         report.append("  FIX PROMPTS")
         report.append("================================================================================")
@@ -305,17 +281,13 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
         if not fix_prompts:
             report.append("  [*] No fix prompts generated.")
         else:
-            report.append("  Fix prompts have been generated for each bug.")
-            report.append("  Paste them into Cursor, Antigravity, or Claude")
-            report.append("  to get an AI-assisted fix with full context.")
+            report.append("  Fix prompts generated for each bug.")
+            report.append("  Paste into Cursor, Antigravity, or Claude to get an AI fix.")
             report.append("")
-            # fix_prompts contains list of tuples: (filename, severity)
-            # we need to match it with titles inside bug_reports.
-            # Usually they are 1:1 matching by index.
             for idx, (p_file, _) in enumerate(fix_prompts):
                 title = bug_reports[idx].get("title", "Unknown") if idx < len(bug_reports) else "Unknown"
                 report.append(f"  {p_file:<31} ->  {title}")
-                
+
         report.append("")
         report.append("")
         report.append("================================================================================")
@@ -330,11 +302,40 @@ Keep it under 300 words. Be specific, not generic. Return only the prompt text, 
         report.append("")
         report.append("================================================================================")
         report.append("  END OF REPORT")
-        report.append("  Phantom QA Agent | github.com/yourname/phantom-qa")
+        report.append("  Phantom QA Agent v2.0")
         report.append("================================================================================")
         report.append("")
 
         markdown = "\n".join(report)
         summary_path.write_text(markdown, encoding="utf-8")
-        logger.info(f"Summary report saved to {summary_path}")
+        logger.info(f"Report saved to {summary_path}")
         return markdown
+
+    # ── Legacy alias — keep backward compatibility ────────────────────────────
+
+    def generate_summary(
+        self,
+        project_name: str,
+        bug_reports: list,
+        app_model: dict,
+        regression_delta: dict,
+        fix_prompts: list,
+        scan_start_time: datetime,
+        scan_end_time: datetime,
+    ) -> str:
+        """Legacy wrapper — calls write_report() with app_model fields."""
+        url = app_model.get("base_url") or app_model.get("url") or "Unknown"
+        pages = app_model.get("crawled_urls", [])
+        journeys = app_model.get("journeys", [])
+        duration = (scan_end_time - scan_start_time).total_seconds()
+        return self.write_report(
+            url=url,
+            name=project_name,
+            pages=[{"url": u, "title": ""} for u in pages],
+            bug_reports=bug_reports,
+            fix_prompts=fix_prompts,
+            regression=regression_delta,
+            journeys=journeys,
+            duration=duration,
+            scan_start=scan_start_time,
+        )
