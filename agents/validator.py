@@ -10,7 +10,9 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
+
+from browser.runner import PhantomBrowser
 
 from google import genai
 from google.genai import types
@@ -32,6 +34,10 @@ class ValidatorAgent:
         self.screenshots_dir = screenshots_dir
         self.reports_dir = screenshots_dir.parent
         self.bug_reports: list[dict] = []
+
+    async def validate(self, browser, events: list) -> list:
+        """Wrapper for same-session integration."""
+        return await self.validate_all(events)
 
     async def validate_all(self, events: list) -> list:
         """

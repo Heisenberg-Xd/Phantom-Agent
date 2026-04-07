@@ -135,6 +135,7 @@ Return only the prompt text, nothing else."""
         journeys: list,
         duration: float,
         scan_start: datetime,
+        auth_stats: dict = None,
     ) -> str:
         """
         Generate and save report.md.
@@ -148,9 +149,28 @@ Return only the prompt text, nothing else."""
 
         total_bugs = len(bug_reports)
         visited_count = len(pages)
-        journeys_count = len(journeys)
-        coverage_pct = min(round((visited_count / max(8, 1)) * 100), 100)
+        # Calculate journeys based on success
+        executed_journeys = [j for j in journeys if j.get("executed_steps", 0) > 0]
+        journeys_count = len(executed_journeys)
+        
+        logger.info(f"[report] rendering events={total_bugs} journeys={journeys_count}")
+        
+        # Coverage Patch - Interaction based
+        expected_steps = sum([len(j.get("steps", [])) for j in journeys])
+        executed_steps = sum([j.get("executed_steps", 0) for j in journeys])
+        
+        if expected_steps > 0:
+            coverage_pct = round((executed_steps / expected_steps) * 100)
+        else:
+            coverage_pct = 0
+            
         cov_str = f"{coverage_pct}%"
+        
+        status_text = "PASSED"
+        if journeys and journeys_count == 0:
+            status_text = "FAILED (CRITICAL)"
+        elif not journeys:
+            status_text = "FAILED (NO JOURNEYS)"
 
         severity_counter = Counter(r.get("severity", "low").lower() for r in bug_reports)
 
@@ -188,17 +208,26 @@ Return only the prompt text, nothing else."""
         report.append("================================================================================")
         report.append("")
         report.append(f"  Project   : {name}")
-        report.append(f"  Target    : {url}")          # ← always real URL, never Unknown
+        report.append(f"  Target    : {url}")
         report.append(f"  Scan Date : {scan_date_fmt}")
         report.append(f"  Duration  : {duration_fmt}s")
+        report.append(f"  Status    : {status_text}")
         report.append("  Generated : Phantom QA Agent v2.0")
         report.append("")
+        
+        if status_text.startswith("FAILED"):
+             report.append("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+             report.append("  CRITICAL FAILURE: Planner/executor failed to produce real user interactions")
+             report.append("  Possible causes: selectors changed, auth walls, or domain misconfiguration.")
+             report.append("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+             report.append("")
+
         report.append("================================================================================")
         report.append("  SCAN SUMMARY")
         report.append("================================================================================")
         report.append("")
         report.append("  +-------------+----------+---------------+-----------+----------+")
-        report.append("  | Bugs Found  | Journeys | Pages Visited | Coverage  | Duration |")
+        report.append("  | Total Bugs  | Journeys | Pages Visited | Coverage  | Duration |")
         report.append("  +-------------+----------+---------------+-----------+----------+")
         report.append(f"  | {total_bugs:^11} | {journeys_count:^8} | {visited_count:^13} | {cov_str:^9} | {duration_fmt+'s':^8} |")
         report.append("  +-------------+----------+---------------+-----------+----------+")
@@ -210,7 +239,18 @@ Return only the prompt text, nothing else."""
         report.append(f"  MEDIUM    [{bar('medium')}]  {severity_counter.get('medium', 0)}")
         report.append(f"  LOW       [{bar('low')}]  {severity_counter.get('low', 0)}")
         report.append("")
-        report.append("")
+        
+        if auth_stats:
+            report.append("================================================================================")
+            report.append("  AUTHENTICATION")
+            report.append("================================================================================")
+            report.append("")
+            report.append(f"  Login Required   : {'Yes' if auth_stats.get('auth_required') else 'No'}")
+            report.append(f"  User-Assisted    : {'Yes' if auth_stats.get('auth_assisted') else 'No'}")
+            report.append(f"  Login Success    : {'Yes' if auth_stats.get('auth_success') else 'No'}")
+            report.append(f"  Pages Unlocked   : {auth_stats.get('pages_unlocked', 0)}")
+            report.append("")
+        
         report.append("================================================================================")
         report.append("  PAGES VISITED")
         report.append("================================================================================")

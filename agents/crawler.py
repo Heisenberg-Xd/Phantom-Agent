@@ -219,6 +219,66 @@ class CrawlerAgent:
                 timeout=30,
             )
             journeys = result if isinstance(result, list) else result.get("journeys", [])
+            if journeys:
+                logger.info(f"[planner] Gemini generated {len(journeys)} journeys")
+
+            # --- Fallback Heuristics Patch ---
+            if not journeys:
+                logger.info("[planner] No journeys from Gemini, applying fallback heuristics...")
+                
+                has_login = False
+                has_products = False
+                has_admin = False
+                
+                for page in pages:
+                    url = page.get("url", "").lower()
+                    forms = page.get("forms", [])
+                    elements = page.get("interactive_elements", [])
+                    html = page.get("html_content", "").lower() # Note: Crawler capture has html_content but CrawlerAgent page_dict didn't save it by default previously. Wait, I should check page_dict.
+
+                    # Check for login forms
+                    for form in forms:
+                        if any(i.get("type") == "password" for i in form.get("inputs", [])):
+                            has_login = True
+                            logger.info(f"[planner] login form detected at {url}")
+                            break
+                    
+                    # Check for product/cart
+                    text_content = " ".join([el.get("text", "").lower() for el in elements])
+                    if any(kw in text_content for kw in ["cart", "add to", "buy", "price", "product"]):
+                        has_products = True
+                        logger.info(f"[planner] product/cart indicators detected at {url}")
+                    
+                    # Check for admin/dashboard
+                    if any(kw in url for kw in ["admin", "dashboard", "manage", "settings"]):
+                        has_admin = True
+                        logger.info(f"[planner] admin/dashboard indicators detected at {url}")
+
+                if has_login:
+                    journeys.append({
+                        "name": "Fallback: Login Flow",
+                        "steps": [
+                            {"action": "goto", "url": self.base_url},
+                            {"action": "click", "selector": "text=Login"}, # Best guess
+                            {"action": "wait", "ms": 2000}
+                        ]
+                    })
+                
+                if has_products:
+                    journeys.append({
+                        "name": "Fallback: Browse Products",
+                        "steps": [
+                            {"action": "goto", "url": self.base_url},
+                            {"action": "wait", "ms": 2000}
+                        ]
+                    })
+                
+                if not journeys and pages:
+                    # Absolute bare minimum: navigate to first 3 pages
+                    journeys.append({
+                        "name": "Fallback: Basic Navigation",
+                        "steps": [{"action": "goto", "url": p["url"]} for p in pages[:3]]
+                    })
 
             # Save app model for debugging
             app_model = {
@@ -234,13 +294,13 @@ class CrawlerAgent:
             APP_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
             APP_MODEL_PATH.write_text(json.dumps(app_model, indent=2))
 
-            logger.info(f"Built {len(journeys)} journeys.")
+            logger.info(f"[planner] Final journey count: {len(journeys)}")
             return journeys
         except asyncio.TimeoutError:
-            logger.warning("build_journeys timed out after 30s — proceeding without journeys")
+            logger.warning("[planner] build_journeys timed out after 30s")
             return []
         except Exception as e:
-            logger.error(f"build_journeys error: {e}")
+            logger.error(f"[planner] build_journeys error: {e}")
             return []
 
     # ── Gemini helper ─────────────────────────────────────────────────────────

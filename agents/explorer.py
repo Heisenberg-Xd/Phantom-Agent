@@ -36,6 +36,13 @@ class FlaggedEvent:
     form_field: Optional[str] = None
 
 
+@dataclass
+class ExplorationResult:
+    """Consolidated exploration output."""
+    events: list[dict]
+    journeys: list[dict]
+
+
 # ── Real bug filters — no noise allowed ───────────────────────────────────────
 
 JS_ERROR_KEYWORDS = [
@@ -63,7 +70,37 @@ def _is_real_http_error(status: int, request_url: str, base_domain: str) -> bool
         return False
 
 
-# ── Smart element finder ──────────────────────────────────────────────────────
+# ── Known-Site Bootstrap Registry ──────────────────────────────────────────────
+
+KNOWN_BOOTSTRAPS = {
+    "saucedemo.com": {
+        "journey": "login_inventory_checkout",
+        "selectors": {
+            "username": "#user-name",
+            "password": "#password",
+            "submit": "#login-button",
+            "inventory": ".inventory_list",
+            "add_to_cart": ".btn_inventory",
+            "checkout": "#checkout"
+        }
+    },
+    "the-internet.herokuapp.com": {
+        "journey": "fast_login",
+        "selectors": {
+            "username": "#username",
+            "password": "#password",
+            "submit": "button[type='submit']"
+        }
+    },
+    "parabank.parasoft.com": {
+        "journey": "account_overview",
+        "selectors": {
+            "username": "input[name='username']",
+            "password": "input[name='password']",
+            "submit": "input[type='submit']"
+        }
+    }
+}
 
 async def find_element(page, hints: dict):
     """
@@ -299,23 +336,42 @@ class ExplorerAgent:
         self.screenshots_dir = screenshots_dir
         self.headless = headless
         self.credentials = credentials
-        self.login_steps = login_steps
-        self.flagged_events: list[FlaggedEvent] = []
+        self.login_steps = login_steps # Missing previously
+        self.flagged_events = [] # Missing previously
+        
+        # Legacy auth tracking (internal use only now)
+        self.auth_required = False
+        self.auth_assisted = False
+        self.auth_success = False
+        self.pages_unlocked = []
 
-    async def explore(self) -> list:
+    async def explore(self, browser: PhantomBrowser = None): 
         """
-        Main explore method. Returns list of FlaggedEvent dicts.
-        Wrapped in timeout — never blocks the pipeline.
+        Main explore method. Returns ExplorationResult.
+        [recovery] using legacy generic explorer path
         """
+        logger.info("[recovery] using legacy generic explorer path")
         try:
-            await asyncio.wait_for(self._run_exploration(), timeout=240)
+            # Use longer 120s timeout for better hydration and complete fuzzing
+            if browser:
+                await asyncio.wait_for(self._run_exploration_on_browser(browser), timeout=120)
+            else:
+                async with PhantomBrowser(self.screenshots_dir, headless=self.headless) as new_browser:
+                    await asyncio.wait_for(self._run_exploration_on_browser(new_browser), timeout=120)
         except asyncio.TimeoutError:
-            logger.info("Explorer timeout — moving to validation")
+            logger.warning("[explorer] Phase 2 timeout — 120s limit reached")
         except Exception as e:
             logger.error(f"Explorer error: {e}")
 
         # Convert dataclasses to dicts for pipeline compatibility
-        return [self._event_to_dict(e) for e in self.flagged_events]
+        events = [self._event_to_dict(e) for e in self.flagged_events]
+        
+        logger.info(f"[explorer] returning {len(events)} events")
+        return ExplorationResult(
+            events=events,
+            journeys=self.journeys
+        )
+
 
     def _event_to_dict(self, event: FlaggedEvent) -> dict:
         return {
@@ -331,94 +387,125 @@ class ExplorerAgent:
             "edge_case_used": event.edge_case_used,
         }
 
-    async def _run_exploration(self):
-        """Run all exploration phases."""
-        async with PhantomBrowser(self.screenshots_dir, headless=self.headless) as browser:
-            if self.login_steps:
+    async def _run_exploration_on_browser(self, browser: PhantomBrowser):
+        """Purely generic exploration path (Bootstrap and HITL disabled)."""
+        if self.login_steps:
+            try:
                 await browser.execute_login(self.login_steps)
+            except Exception as e:
+                logger.error(f"Login failed on generic path: {e}")
 
-            # Phase A: probe every discovered page FIRST (always runs)
-            logger.info(f"Explorer probing {len(self.pages)} pages...")
-            for page_info in self.pages:
-                url = page_info.get("url", "")
-                if url:
-                    await self._probe_page(browser, url)
-
-            # Phase B: attempt login if login page detected (runs after probing unless login_steps was used)
-            if not self.login_steps:
-                login_pages = [
-                    p for p in self.pages
-                    if any(kw in p.get("url", "").lower() for kw in ["login", "signin", "auth"])
-                    or any(kw in p.get("title", "").lower() for kw in ["login", "sign in"])
-                ]
-                logged_in = False
-                if login_pages or self.credentials:
-                    logger.info("Login page detected — attempting login (max 30s)...")
+        # Phase B: probe every discovered page FIRST (always runs)
+        logger.info(f"Explorer probing {len(self.pages)} pages...")
+        for page_info in self.pages:
+            url = page_info.get("url", "")
+            if url:
+                # Sanity check: Live element discovery
+                await browser.navigate(url, timeout=8000, take_screenshot=False)
+                
+                # Live locator check (no offline copies)
+                raw_els = await browser.page.locator('button, a, input, [role="button"]').count()
+                visible_els = 0
+                for i in range(raw_els):
                     try:
-                        logged_in = await asyncio.wait_for(
-                            handle_login(browser.page, self.base_url, self.credentials),
-                            timeout=30,
-                        )
-                        logger.info(f"Login result: {'success' if logged_in else 'failed/not available'}")
-                    except asyncio.TimeoutError:
-                        logger.info("Login handler timed out after 30s")
-                    except Exception as e:
-                        logger.error(f"Login handler error: {e}")
+                        if await browser.page.locator('button, a, input, [role="button"]').nth(i).is_visible():
+                            visible_els += 1
+                    except:
+                        continue
+                
+                logger.info(f"[explorer] raw events detected: {raw_els}")
+                logger.info(f"[explorer] filtered events kept: {visible_els}")
+                logger.info(f"[explorer] dropped hidden: {raw_els - visible_els}")
 
-            # The journeys will be loaded from app_model.json after edge case testing
+                await self._probe_page(browser, url)
 
-            # Phase D: form fuzzing on pages with forms
-            logger.info("Fuzzing forms...")
-            for page_info in self.pages[:5]:  # limit to first 5 pages
-                url = page_info.get("url", "")
-                forms = page_info.get("forms", [])
-                if url and forms:
-                    try:
-                        await self._fuzz_forms(browser, url, forms)
-                    except Exception as e:
-                        logger.error(f"Form fuzz error on {url}: {e}")
+        # Phase D: form fuzzing on pages with forms
+        logger.info("Fuzzing forms...")
+        for page_info in self.pages[:5]:  # limit to first 5 pages
+            url = page_info.get("url", "")
+            forms = page_info.get("forms", [])
+            if url and forms:
+                try:
+                    await self._fuzz_forms(browser, url, forms)
+                except Exception as e:
+                    logger.error(f"Form fuzz error on {url}: {e}")
 
-            # Phase E: file upload testing
-            logger.info("Testing file uploads...")
-            for page_info in self.pages:
-                url = page_info.get("url", "")
-                has_file_input = any(
-                    inp.get("type") == "file"
-                    for form in page_info.get("forms", [])
-                    for inp in form.get("inputs", [])
-                )
-                if has_file_input and url:
-                    try:
-                        await browser.navigate(url, timeout=15000)
-                        upload_events = await test_file_upload(browser.page, self.base_url)
-                        for evt in upload_events:
-                            await self._flag(browser, evt)
-                    except Exception as e:
-                        logger.error(f"File upload test error on {url}: {e}")
+        # Phase E: file upload testing
+        logger.info("Testing file uploads...")
+        for page_info in self.pages:
+            url = page_info.get("url", "")
+            has_file_input = any(
+                inp.get("type") == "file"
+                for form in page_info.get("forms", [])
+                for inp in form.get("inputs", [])
+            )
+            if has_file_input and url:
+                try:
+                    await browser.navigate(url, timeout=15000)
+                    upload_events = await test_file_upload(browser.page, self.base_url)
+                    for evt in upload_events:
+                        await self._flag(browser, evt)
+                except Exception as e:
+                    logger.error(f"File upload test error on {url}: {e}")
 
-            # execute journeys
-            logger.info(f"Executing {len(self.journeys)} journeys...")
-            for journey in self.journeys:
-                result = await self._execute_journey(browser, journey)
-                if result and result.get("failed"):
-                    journey["failed"] = True
-                    await self._flag(browser, FlaggedEvent(
-                        event_type="journey_failure",
-                        severity_hint="medium",
-                        url=result.get("url", ""),
-                        description=f"Journey '{journey.get('name', 'Unknown')}' failed at step: {result.get('failed_step')}",
-                        screenshot_path=result.get("screenshot", ""),
-                        steps_taken=[f"Executing journey '{journey.get('name', 'Unknown')}'", f"Failed step: {result.get('failed_step')}"]
-                    ))
-                else:
-                    journey["failed"] = False
+        # execute journeys
+        logger.info(f"Executing {len(self.journeys)} journeys...")
+        for journey in self.journeys:
+            result = await self._execute_journey(browser, journey)
+            if result and result.get("failed"):
+                journey["failed"] = True
+                await self._flag(browser, FlaggedEvent(
+                    event_type="journey_failure",
+                    severity_hint="medium",
+                    url=result.get("url", ""),
+                    description=f"Journey '{journey.get('name', 'Unknown')}' failed at step: {result.get('failed_step')}",
+                    screenshot_path=result.get("screenshot", ""),
+                    steps_taken=[f"Executing journey '{journey.get('name', 'Unknown')}'", f"Failed step: {result.get('failed_step')}"]
+                ))
+            else:
+                journey["failed"] = False
 
         logger.info(f"Explorer complete. {len(self.flagged_events)} events flagged.")
+
+    async def _fast_login_rule(self, page):
+        """Quick check for common login fields (3s timeout)."""
+        common_ids = ["#user-name", "#username", "#email", "#login-button", "[data-test*=login]"]
+        common_types = ["input[type=password]", "input[type=text]", "button[type=submit]"]
+        
+        found = 0
+        for sel in common_ids + common_types:
+            try:
+                if await page.locator(sel).count() > 0:
+                    found += 1
+            except:
+                continue
+        
+        if found >= 2:
+            logger.info(f"[explorer] Fast login detect matches: {found} elements")
+            return True
+        return False
+
+    async def perform_auth(self, browser: PhantomBrowser, credentials: dict) -> bool:
+        """Submit credentials using handle_login executor."""
+        try:
+            logger.info("[executor] login submitted")
+            success = await handle_login(browser.page, self.base_url, credentials)
+            self.auth_success = success
+            if success:
+                logger.info("[executor] resumed exploration")
+            return success
+        except Exception as e:
+            logger.error(f"[executor] Auth failure: {e}")
+            return False
 
     async def _probe_page(self, browser: PhantomBrowser, url: str):
         """Navigate to page and check for real bugs only."""
         try:
-            capture = await browser.navigate(url, timeout=15000, take_screenshot=False)
+            # Note: browser.navigate already stabilizes and waits
+            capture = await browser._capture_page(url, 0, take_screenshot=True)
+            
+            # Diagnostic for probe
+            logger.info(f"[explorer] Probing {url} for security flags...")
 
             # Check HTTP errors — 5xx on base domain = server error
             # 401 on base domain = missing auth protection (auth_bypass)
@@ -482,75 +569,76 @@ class ExplorerAgent:
         except Exception as e:
             logger.error(f"_probe_page error for {url}: {e}")
 
-async def journey_login(page):
-    await page.goto("https://demo.testfire.net/login.jsp")
-    await page.fill("#uid", "admin")
-    await page.fill("#passw", "admin")
-    await page.click("[type=submit]")
-    await page.wait_for_timeout(2000)
-    
-    # Verify login succeeded
-    current_url = page.url
-    if "main.jsp" in current_url or "bank" in current_url:
-        return {"status": "PASSED", "reached": current_url}
-    else:
-        return {"status": "FAILED", 
-                "reason": "Did not reach dashboard after login"}
-
-async def journey_view_account(page):
-    # Login first
-    await journey_login(page)
-    
-    # Navigate to account
-    await page.goto(
-        "https://demo.testfire.net/bank/main.jsp"
-    )
-    await page.wait_for_timeout(1000)
-    
-    content = await page.content()
-    if "account" in content.lower():
-        return {"status": "PASSED"}
-    return {"status": "FAILED", 
-            "reason": "Account page not accessible"}
-
-async def journey_transfer(page):
-    await journey_login(page)
-    await page.goto(
-        "https://demo.testfire.net/bank/transfer.jsp"
-    )
-    await page.wait_for_timeout(1000)
-    
-    # Try a transfer
-    try:
-        await page.select_option(
-            "select[name='fromAccount']", index=0
-        )
-        await page.select_option(
-            "select[name='toAccount']", index=1
-        )
-        await page.fill(
-            "input[name='transferAmount']", "100"
-        )
+    async def journey_login(self, page):
+        await page.goto("https://demo.testfire.net/login.jsp")
+        await page.fill("#uid", "admin")
+        await page.fill("#passw", "admin")
         await page.click("[type=submit]")
         await page.wait_for_timeout(2000)
         
-        content = await page.content()
-        if "error" in content.lower():
+        # Verify login succeeded
+        current_url = page.url
+        if "main.jsp" in current_url or "bank" in current_url:
+            return {"status": "PASSED", "reached": current_url}
+        else:
             return {"status": "FAILED", 
-                    "reason": "Transfer returned error"}
-        return {"status": "PASSED"}
-    except Exception as e:
-        return {"status": "FAILED", "reason": str(e)}
+                    "reason": "Did not reach dashboard after login"}
+
+    async def journey_view_account(self, page):
+        # Login first
+        await self.journey_login(page)
+        
+        # Navigate to account
+        await page.goto(
+            "https://demo.testfire.net/bank/main.jsp"
+        )
+        await page.wait_for_timeout(1000)
+        
+        content = await page.content()
+        if "account" in content.lower():
+            return {"status": "PASSED"}
+        return {"status": "FAILED", 
+                "reason": "Account page not accessible"}
+
+    async def journey_transfer(self, page):
+        await self.journey_login(page)
+        await page.goto(
+            "https://demo.testfire.net/bank/transfer.jsp"
+        )
+        await page.wait_for_timeout(1000)
+        
+        # Try a transfer
+        try:
+            await page.select_option(
+                "select[name='fromAccount']", index=0
+            )
+            await page.select_option(
+                "select[name='toAccount']", index=1
+            )
+            await page.fill(
+                "input[name='transferAmount']", "100"
+            )
+            await page.click("[type=submit]")
+            await page.wait_for_timeout(2000)
+            
+            content = await page.content()
+            if "error" in content.lower():
+                return {"status": "FAILED", 
+                        "reason": "Transfer returned error"}
+            return {"status": "PASSED"}
+        except Exception as e:
+            return {"status": "FAILED", "reason": str(e)}
+
 
     async def _execute_journey(self, browser: PhantomBrowser, journey: dict) -> dict:
         """Execute a single user journey using smart element finder."""
         hardcoded = journey.get("hardcoded")
         if hardcoded == "journey_login":
-            return await journey_login(browser.page)
+            return await self.journey_login(browser.page)
         elif hardcoded == "journey_view_account":
-            return await journey_view_account(browser.page)
+            return await self.journey_view_account(browser.page)
         elif hardcoded == "journey_transfer":
-            return await journey_transfer(browser.page)
+            return await self.journey_transfer(browser.page)
 
         steps = journey.get("steps", [])
         pages_involved = journey.get("pages_involved", [self.base_url])
@@ -572,61 +660,101 @@ async def journey_transfer(page):
             action = step.get("action", "").lower()
             selector = step.get("selector", "")
             value = step.get("value", "")
-            steps_taken.append(f"Step: {action} on '{selector}'")
+            logger.info(f"[executor] Attempting {action} on {selector or value}")
 
             try:
-                if action in ("fill", "type", "input"):
+                # 15s aggregate wait before stall breaker
+                t_start = time.time()
+                success = False
+                
+                while time.time() - t_start < 15:
                     try:
-                        await browser.page.fill(selector, value, timeout=3000)
+                        if action in ("fill", "type", "input"):
+                            await browser.page.fill(selector, value, timeout=5000)
+                            success = True
+                            break
+                        elif action in ("click", "tap"):
+                            await browser.page.click(selector, timeout=5000)
+                            await browser.wait_for_navigation(timeout=3000)
+                            success = True
+                            break
+                        elif action == "press":
+                            await browser.page.press(selector, value, timeout=5000)
+                            success = True
+                            break
+                        elif action == "goto":
+                            await browser.navigate(step.get("url"), timeout=8000)
+                            success = True
+                            break
+                        elif action == "wait":
+                            await asyncio.sleep(step.get("ms", 1000) / 1000.0)
+                            success = True
+                            break
                     except Exception:
-                        # Try smart finder as fallback
-                        el = await find_element(browser.page, {"purpose": "login_email"})
-                        if el:
-                            await el.fill(value)
+                        logger.debug(f"[executor] selector {selector} failed, retrying...")
+                        await asyncio.sleep(1)
 
-                        else:
-                            raise Exception("Element not found via smart finder")
-
-                elif action in ("click", "tap"):
-                    try:
-                        await browser.page.click(selector, timeout=3000)
-                    except Exception:
-                        # Try visible text click
-                        try:
-                            await browser.page.click(f"text={value}", timeout=2000)
-                        except Exception:
-                            raise Exception("Element not found for click")
-                    await browser.wait_for_navigation(timeout=2000)
-
-                elif action == "press":
-                    try:
-                        await browser.page.press(selector, value, timeout=3000)
-                    except Exception:
-                        raise Exception("Element not found for press")
-
-                await asyncio.sleep(0.3)
+                if success:
+                    logger.info(f"[executor] step successful: {action}")
+                    if "executed_steps" not in journey:
+                        journey["executed_steps"] = 0
+                    journey["executed_steps"] += 1
+                else:
+                    # Trigger Stall Breaker
+                    logger.info("[executor] Stall detected (15s idle), triggering stall breaker...")
+                    breaker_success = await self._stall_breaker(browser.page)
+                    if not breaker_success:
+                        logger.warning(f"[executor] Journey '{name}' aborted: selector and stall breaker failed.")
+                        break # Abort journey
 
             except Exception as e:
-                logger.debug(f"Journey step error ({action} on {selector}): {e}")
-                
-                # capture screenshot of failure
-                import datetime as _dt
-                ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                shot_path = str(self.screenshots_dir / f"journey_fail_{ts}.png")
-                try:
-                    await browser.page.screenshot(path=shot_path, full_page=True)
-                except Exception:
-                    shot_path = ""
-                
-                return {
-                    "failed": True,
-                    "failed_step": f"{action} on '{selector}'",
-                    "url": browser.page.url,
-                    "screenshot": shot_path,
-                    "reason": str(e)
-                }
-                
-        return {"status": "PASSED"}
+                logger.error(f"[executor] Error executing step: {e}")
+                break
+
+        return {"status": "PASSED" if journey.get("executed_steps", 0) > 0 else "FAILED"}
+
+    async def _stall_breaker(self, page) -> bool:
+        """Force DOM rescan and pick highest-confidence CTA."""
+        logger.info("[executor] Fallback strategy: rescanning DOM for high-confidence CTAs...")
+        try:
+            # Rank by CTA probability
+            cta_patterns = [
+                (r"login|sign in", "Login"),
+                (r"continue|next", "Continue"),
+                (r"add to cart", "Add to Cart"),
+                (r"checkout", "Checkout"),
+                (r"submit", "Submit"),
+                (r"menu|nav", "Navigation"),
+                (r"logout|sign out", "Logout")
+            ]
+            
+            # Extract elements
+            elements = await page.evaluate("""() => {
+                const els = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"]'));
+                return els.map(e => ({
+                    text: (e.innerText || e.value || '').trim().toLowerCase(),
+                    visible: e.offsetWidth > 0 && e.offsetHeight > 0,
+                    selector: e.id ? '#' + e.id : (e.name ? '[name="' + e.name + '"]' : '')
+                })).filter(e => e.visible && (e.text || e.selector));
+            }""")
+            
+            for pattern, name in cta_patterns:
+                for el in elements:
+                    if re.search(pattern, el['text']):
+                        logger.info(f"[executor] Fallback: Clicked '{el['text']}' (Matched: {name})")
+                        try:
+                            # Use text-based clicking as fallback if selector is missing
+                            if el['selector']:
+                                await page.click(el['selector'], timeout=3000)
+                            else:
+                                await page.click(f"text={el['text']}", timeout=3000)
+                            return True
+                        except:
+                            continue
+            return False
+        except Exception as e:
+            logger.error(f"[executor] Stall breaker failed: {e}")
+            return False
 
     async def _fuzz_forms(self, browser: PhantomBrowser, url: str, forms: list):
         """Fuzz forms with security-relevant inputs only."""

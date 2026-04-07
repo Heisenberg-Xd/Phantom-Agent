@@ -180,6 +180,12 @@ class PhantomBrowser:
 
         try:
             await self._page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            # wait-stability patch: wait for networkidle and stabilize
+            try:
+                await self._page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            await asyncio.sleep(1.5) # stabilization wait
         except Exception as e:
             logger.debug(f"Navigation error for {url}: {e}")
             # Do not wait for load_state if goto failed fast
@@ -254,30 +260,82 @@ class PhantomBrowser:
     async def get_all_forms(self) -> list[dict]:
         """Extract all forms with their inputs from the current page."""
         try:
+            # 1. Broad selector check for safety assertion
+            visible_inputs = await self._page.evaluate("""() => {
+                const els = document.querySelectorAll('input, select, textarea, [role="textbox"]');
+                return Array.from(els).filter(e => e.offsetWidth > 0 && e.offsetHeight > 0).length;
+            }""")
+
             forms = await self._page.evaluate("""() => {
-                return Array.from(document.querySelectorAll('form')).map(form => ({
-                    action: form.action || '',
-                    method: form.method || 'get',
-                    inputs: Array.from(form.querySelectorAll('input, textarea, select')).map(el => ({
+                const getInputs = (container) => {
+                    return Array.from(container.querySelectorAll('input, textarea, select, [role="textbox"]')).map(el => ({
                         name: el.name || el.id || el.placeholder || '',
-                        type: el.type || el.tagName.toLowerCase(),
+                        type: (el.type || el.tagName.toLowerCase()).toLowerCase(),
                         id: el.id || '',
                         placeholder: el.placeholder || '',
                         required: el.required,
                         selector: el.id ? `#${el.id}` : (el.name ? `[name="${el.name}"]` : '')
-                    })).filter(el => el.type !== 'hidden')
-                }));
+                    })).filter(el => el.type !== 'hidden');
+                };
+
+                const isLogin = (inputs) => {
+                    const hasPassword = inputs.some(i => i.type === 'password');
+                    const hasUser = inputs.some(i => i.type === 'email' || i.name.toLowerCase().includes('user') || i.name.toLowerCase().includes('login'));
+                    return hasPassword && hasUser;
+                };
+
+                const forms = Array.from(document.querySelectorAll('form')).map(form => {
+                    const inputs = getInputs(form);
+                    return {
+                        action: form.action || '',
+                        method: form.method || 'get',
+                        inputs: inputs,
+                        type: isLogin(inputs) ? 'login_form' : 'standard'
+                    };
+                });
+
+                // Handle orphaned inputs (common in modern apps)
+                const inputsInForms = new Set();
+                forms.forEach(f => f.inputs.forEach(i => i.id && inputsInForms.add(i.id)));
+                
+                const allInputs = getInputs(document);
+                const orphanedInputs = allInputs.filter(i => !i.id || !inputsInForms.has(i.id));
+                
+                if (orphanedInputs.length > 0) {
+                    forms.push({
+                        action: 'implicit',
+                        method: 'post',
+                        inputs: orphanedInputs,
+                        type: isLogin(orphanedInputs) ? 'login_form' : 'standard'
+                    });
+                }
+                return forms;
             }""")
+
+            # Semantic logging
+            total_inputs = sum(len(f['inputs']) for f in forms)
+            logger.info(f"[explorer] found {total_inputs} input fields")
+            
+            for f in forms:
+                if f.get('type') == 'login_form':
+                    logger.info("[explorer] generated login_form event")
+            
+            # Safety assertion
+            if visible_inputs > 0 and total_inputs == 0:
+                raise RuntimeError("Interactive form elements detected but event extraction failed")
+                
             return forms or []
         except Exception as e:
+            if "Interactive form elements detected" in str(e):
+                raise e
             logger.warning(f"get_all_forms failed: {e}")
             return []
 
     async def get_interactive_elements(self) -> list[dict]:
-        """Get all buttons and clickable elements."""
+        """Get all buttons and clickable elements expanded discovery."""
         try:
             elements = await self._page.evaluate("""() => {
-                const selectors = 'button, [role="button"], input[type="submit"], input[type="button"], a[href]';
+                const selectors = 'button, [role="button"], input[type="submit"], input[type="button"], a[href], [onclick], [tabindex]';
                 return Array.from(document.querySelectorAll(selectors)).map(el => ({
                     tag: el.tagName.toLowerCase(),
                     text: (el.textContent || el.value || el.placeholder || '').trim().substring(0, 80),
@@ -285,8 +343,17 @@ class PhantomBrowser:
                     href: el.href || '',
                     type: el.type || '',
                     selector: el.id ? `#${el.id}` : ''
-                })).filter(el => el.text || el.href);
+                })).filter(el => el.text || el.href || el.tag === 'button');
             }""")
+            
+            # CTA text heuristics discovery
+            cta_keywords = ["login", "sign in", "submit", "continue", "next", "add to cart", "checkout", "save", "search"]
+            for el in elements:
+                t = el.get('text', '').lower()
+                if any(kw in t for kw in cta_keywords):
+                    logger.info(f"[explorer] found submit button: {el['text']}")
+
+            logger.info(f"[explorer] total actionable events: {len(elements)}")
             return elements or []
         except Exception as e:
             logger.warning(f"get_interactive_elements failed: {e}")

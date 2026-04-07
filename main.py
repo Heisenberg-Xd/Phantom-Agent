@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import sys
+import getpass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -218,6 +219,27 @@ def deduplicate_bugs(bugs):
     return list(groups.values())
 
 
+def collect_credentials_hitl(url: str) -> dict:
+    """Synchronous helper to collect credentials from terminal."""
+    print("\n" + "="*60)
+    print("🔐 [LOGIN REQUIRED] Authentication Wall Detected")
+    print(f"URL: {url}")
+    print("="*60)
+    
+    attempts = 0
+    while attempts < 3:
+        try:
+            username = input("\nEnter username: ")
+            password = getpass.getpass("Enter password: ")
+            if username and password:
+                return {"username": username, "password": password, "email": username}
+            print("❌ Username and password are required.")
+            attempts += 1
+        except (KeyboardInterrupt, EOFError):
+            print("\n⚠️ Login aborted by user.")
+            break
+    return {}
+
 # ── Core async pipeline ───────────────────────────────────────────────────────
 
 async def run_pipeline(
@@ -239,6 +261,7 @@ async def run_pipeline(
     from agents.validator import ValidatorAgent
     from agents.reporter import ReporterAgent
     from memory.store import MemoryStore
+    from browser.runner import PhantomBrowser
 
     pipeline_start = datetime.now(timezone.utc).replace(tzinfo=None)
     screenshots_dir = reports_dir / "screenshots"
@@ -278,78 +301,75 @@ async def run_pipeline(
     except Exception as e:
         logger.error(f"build_journeys failed: {e}")
 
+    auth_stats = {}
+    bug_reports = []
+    events = []
+
     # ── Phase 2: Explore ──────────────────────────────────────────────────────
     t0 = time.time()
     console.print("  [Phase 2]  Exploring............. ", end="")
-    try:
-        explorer = ExplorerAgent(
-            base_url=url,
-            pages=pages,
-            journeys=journeys,
-            screenshots_dir=screenshots_dir,
-            headless=headless,
-            credentials=credentials,
-            login_steps=login_steps,
-        )
-        events = await explorer.explore()
-        assert isinstance(events, list), "Explorer must return a list"
-        console.print(f"done   {len(events)} events ({time.time()-t0:.1f}s)")
-    except AssertionError as e:
-        console.print(f"[red]FAILED[/red]   {e}")
-        logger.error(f"Phase 2 assertion: {e}")
-        events = []
-    except Exception as e:
-        console.print(f"[red]ERROR[/red]")
-        logger.error(f"Phase 2 explore error: {e}")
-        events = []
+    
+    # Same-session browser management
+    async with PhantomBrowser(screenshots_dir, headless=headless) as browser:
+        try:
+            explorer = ExplorerAgent(
+                base_url=url,
+                pages=pages,
+                journeys=journeys,
+                screenshots_dir=screenshots_dir,
+                headless=headless,
+                credentials=credentials,
+                login_steps=login_steps,
+            )
+            
+            # Phase 2a: Generic Exploration
+            exploration_result = await explorer.explore(browser)
+                
+            events = exploration_result.events
+            journeys = exploration_result.journeys
+            
+            logger.info(f"[phase_runner] received {len(events)} events")
+            console.print(f"done   {len(events)} events ({time.time()-t0:.1f}s)")
+            
+            # No hard-fail on 0 events for generic recovery
+            if True: # Always proceed to security/validate
+                # ── Phase 2b: Security Tests ──────────────────────────────────
+                t0 = time.time()
+                console.print("  [Phase 2b] Security Tests......... ", end="")
+                try:
+                    from agents.security import SecurityAgent
+                    security = SecurityAgent(
+                        base_url=url,
+                        pages=pages,
+                        screenshots_dir=screenshots_dir,
+                        headless=headless,
+                        login_steps=login_steps,
+                    )
+                    # Maintains session in the same browser instance
+                    security_bugs = await security.run_tests(browser, events)
+                    bug_reports.extend(security_bugs)
+                    console.print(f"done   {len(security_bugs)} bugs ({time.time()-t0:.1f}s)")
+                except Exception as e:
+                    logger.error(f"Phase 2b security error: {e}")
+                    console.print("done   (failed)")
 
-    # ── Phase 2b: Security Tests ──────────────────────────────────────────────
-    import time
-    t0 = time.time()
-    console.print("  [Phase 2b] Security Tests......... ", end="")
-    try:
-        from agents.security import SecurityAgent
-        security = SecurityAgent(
-            base_url=url,
-            pages=pages,
-            screenshots_dir=screenshots_dir,
-            headless=headless,
-            login_steps=login_steps,
-        )
-        security_bugs = await security.run_all()
-        console.print(f"done   {len(security_bugs)} bugs ({time.time()-t0:.1f}s)")
-    except Exception as e:
-        console.print(f"[red]ERROR[/red]")
-        logger.error(f"Phase 2b security error: {e}")
-        security_bugs = []
-
-    # ── Phase 3: Validate ─────────────────────────────────────────────────────
-    import time
-    t0 = time.time()
-    console.print("  [Phase 3]  Validating............ ", end="")
-    bug_reports = []
-    try:
-        validator = ValidatorAgent(screenshots_dir=screenshots_dir)
-        raw_reports = await validator.validate_all(events)
-        all_bugs = [b for b in raw_reports if b is not None] + security_bugs
-        
-        # Apply the final gate before any deduplication or reporting
-        bugs_to_report = [b for b in all_bugs if should_report_bug(b)]
-        
-        if len(bugs_to_report) == 0:
-            console.print("No confirmed bugs found in this scan.")
-        
-        bug_reports = deduplicate_bugs(bugs_to_report)
-        assert isinstance(bug_reports, list), "Validator must return a list"
-        console.print(f"done   {len(bug_reports)} bugs ({time.time()-t0:.1f}s)")
-    except AssertionError as e:
-        console.print(f"[red]FAILED[/red]   {e}")
-        logger.error(f"Phase 3 assertion: {e}")
-        bug_reports = []
-    except Exception as e:
-        console.print(f"[red]ERROR[/red]")
-        logger.error(f"Phase 3 validate error: {e}")
-        bug_reports = []
+                # ── Phase 3: Validate ─────────────────────────────────────────
+                t0 = time.time()
+                console.print("  [Phase 3]  Validating Bugs....... ", end="")
+                try:
+                    validator = ValidatorAgent(
+                        screenshots_dir=screenshots_dir,
+                    )
+                    # Maintains session
+                    validated_bugs = await validator.validate(browser, bug_reports)
+                    bug_reports = deduplicate_bugs(validated_bugs)
+                    console.print(f"done   {len(bug_reports)} bugs ({time.time()-t0:.1f}s)")
+                except Exception as e:
+                    logger.error(f"Phase 3 validate error: {e}")
+                    console.print("done   (failed)")
+        except Exception as e:
+            console.print(f"[red]ERROR[/red]")
+            logger.error(f"Phase 2 exploration failure: {e}")
 
     # ── Phase 3b: Fix Prompts ─────────────────────────────────────────────────
     console.print("  [Phase 3b] Fix Prompts........... ", end="")
@@ -369,13 +389,11 @@ async def run_pipeline(
         memory = MemoryStore()
         await memory.initialize()
         scan_id = await memory.create_scan(url, {"pages": len(pages)})
-        bug_titles = []
+        bug_titles = [r.get("title", "Unknown Bug") for r in bug_reports]
         for report in bug_reports:
-            title = report.get("title", "Unknown Bug")
-            bug_titles.append(title)
             await memory.save_bug(
                 scan_id=scan_id,
-                title=title,
+                title=report.get("title", "Unknown Bug"),
                 severity=report.get("severity", "low"),
                 steps=json.dumps(report.get("steps_to_reproduce", [])),
                 expected_behavior=report.get("expected_behavior", ""),
@@ -497,22 +515,39 @@ def scan(
     )
 
     scan_end = datetime.now(timezone.utc).replace(tzinfo=None)
+    scan_end = datetime.now(timezone.utc).replace(tzinfo=None)
     duration = (scan_end - scan_start).total_seconds()
 
     console.print()
     console.print(Rule("[bold magenta]== PHANTOM REPORT ==[/bold magenta]", style="magenta"))
     console.print()
 
-    cov_pct = min(len(pages_visited) / max(max_pages, 1) * 100, 100.0)
+    # Coverage Patch - Interaction based
+    expected_steps = sum([len(j.get("steps", [])) for j in journeys_run])
+    executed_steps = sum([j.get("executed_steps", 0) for j in journeys_run])
+    
+    if expected_steps > 0:
+        cov_pct = round((executed_steps / expected_steps) * 100)
+    else:
+        cov_pct = 0
+    
+    # Truthful stats for panel
+    executed_journeys_count = len([j for j in journeys_run if j.get("executed_steps", 0) > 0])
 
     console.print(make_stats_panel(
         bugs_found=len(bug_reports),
-        journeys_tested=len(journeys_run),
+        journeys_tested=executed_journeys_count,
         pages_visited=len(pages_visited),
         coverage_pct=cov_pct,
         duration=duration,
     ))
     console.print()
+
+    # Regression Safety Patch
+    if executed_journeys_count == 0 or cov_pct < 40:
+        console.print("[bold red]Critical failure: no executable journeys detected (Coverage: " + str(cov_pct) + "%)[/bold red]")
+        console.print("[red]Regression Safety Check Failed. Halting pipeline integrations.[/red]")
+        sys.exit(1)
 
     if bug_reports:
         console.print(make_bug_table(bug_reports))

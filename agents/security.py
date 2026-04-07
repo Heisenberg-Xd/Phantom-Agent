@@ -16,26 +16,25 @@ class SecurityAgent:
         self.headless = headless
         self.login_steps = login_steps
 
-    async def run_all(self):
+    async def run_tests(self, browser, events: list):
         all_security_bugs = []
-        async with PhantomBrowser(self.screenshots_dir, headless=self.headless) as browser:
-            page = await browser.new_page()
+        page = browser.page
 
-            logger.info("  [Security] Testing SQL injection on login...")
-            bugs = await self.test_sql_injection_login(page, browser)
-            all_security_bugs.extend(bugs)
+        logger.info("  [Security] Testing SQL injection on login...")
+        bugs = await self.test_sql_injection_login(page, browser)
+        all_security_bugs.extend(bugs)
 
-            logger.info("  [Security] Testing XSS in search...")
-            bugs = await self.test_xss_search(page)
-            all_security_bugs.extend(bugs)
+        logger.info("  [Security] Testing XSS in search...")
+        bugs = await self.test_xss_search(page)
+        all_security_bugs.extend(bugs)
 
-            logger.info("  [Security] Testing IDOR on account pages...")
-            bugs = await self.test_idor(page, browser)
-            all_security_bugs.extend(bugs)
+        logger.info("  [Security] Testing IDOR on account pages...")
+        bugs = await self.test_idor(page, browser)
+        all_security_bugs.extend(bugs)
 
-            logger.info("  [Security] Testing session after logout...")
-            bugs = await self.test_session_persistence(browser)
-            all_security_bugs.extend(bugs)
+        logger.info("  [Security] Testing session after logout...")
+        bugs = await self.test_session_persistence(browser)
+        all_security_bugs.extend(bugs)
 
         return all_security_bugs
 
@@ -244,10 +243,9 @@ class SecurityAgent:
         await context.close()
 
         # Step 4: Re-use cookies
-        new_context_obj = await browser._playwright.chromium.launch()
-        new_context = await new_context_obj.new_context()
-        await new_context.add_cookies(session_cookies)
         new_page = await new_context.new_page()
+        # Ensure our browser wrapper can still work with this page if needed
+        # but for session persistence we stay low-level
 
         try:
             target_url = f"{self.base_url}/bank/main.jsp"
