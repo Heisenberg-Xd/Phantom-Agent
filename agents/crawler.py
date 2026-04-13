@@ -17,6 +17,7 @@ from urllib.parse import urljoin, urlparse
 from google import genai
 
 from browser.runner import PhantomBrowser
+from browser.dom_analyzer import discover_all_forms, discover_all_interactive_elements, extract_internal_links
 
 logger = logging.getLogger("phantom")
 
@@ -115,7 +116,7 @@ class CrawlerAgent:
             if self.login_steps:
                 await browser.execute_login(self.login_steps)
 
-            while queue and len(visited) < self.max_pages:
+            while queue and len(pages) < self.max_pages:
                 url = queue.pop(0)
                 if url in visited:
                     continue
@@ -123,34 +124,46 @@ class CrawlerAgent:
                 try:
                     t = time.time()
                     capture = await browser.navigate(url, timeout=8000)
+                except asyncio.TimeoutError:
+                    visited.add(url)
+                    logger.debug(f"Timeout crawling {url}")
+                    continue
+                    
+                try:
                     logger.info(f"CRAWL: {time.time() - t:.1f}s for {url}")
                     visited.add(url)
                     
+                    # Fetch intelligence using v3.0 logic
+                    try:
+                        forms = await discover_all_forms(browser.page)
+                        interactive_elements = await discover_all_interactive_elements(browser.page)
+                    except Exception as e:
+                        logger.debug(f"DOM Analyzer non-fatal error on {url}: {e}")
+                        forms = []
+                        interactive_elements = {'buttons':[], 'links':[], 'inputs':[], 'dropdowns':[]}
+
                     page_dict = {
                         "url": url,
-                        "title": capture.title,
-                        "screenshot": capture.screenshot_path,
-                        "load_time": capture.load_time_seconds,
-                        "forms": await browser.get_all_forms(),
-                        "interactive_elements": await browser.get_interactive_elements(),
+                        "title": capture.title if capture else "Unknown",
+                        "screenshot": capture.screenshot_path if capture else None,
+                        "load_time": capture.load_time_seconds if capture else 0,
+                        "forms": forms,
+                        "interactive_elements": interactive_elements,
                         "console_errors": [
-                            e.text for e in capture.console_events if e.level == "error"
-                        ],
+                            e.text for e in capture.console_events if capture and e.level == "error"
+                        ] if capture else [],
                         "http_errors": [
                             {"url": e.url, "status": e.status}
                             for e in capture.network_events
-                            if e.status >= 400
-                        ],
+                            if capture and e.status >= 400
+                        ] if capture else [],
                     }
                     pages.append(page_dict)
 
-                    links = await browser.page.eval_on_selector_all(
-                        "a[href]",
-                        "els => els.map(e => e.href)"
-                    )
-                    
-                    for link in links:
-                        if self.base_domain in link and link not in visited:
+                    # v3.0 intelligent link extraction
+                    new_links = await extract_internal_links(browser.page, self.base_url)
+                    for link in new_links:
+                        if link not in visited and link not in queue:
                             queue.append(link)
 
                 except asyncio.TimeoutError:
@@ -190,13 +203,37 @@ class CrawlerAgent:
                 }
             ]
 
-        logger.info("Building journeys with Gemini...")
         
+        # Deterministic journey generation (v3.0 logic)
+        journeys = self._generate_user_journeys_deterministic(pages)
+        if len(journeys) >= 2:
+            logger.info(f"Generated {len(journeys)} user journeys deterministically.")
+            return journeys
+
+        logger.info("Deterministic generation yielded < 2 journeys. Falling back to Gemini...")
+        
+        # Prepare context data to give Gemini real selectors
+        pages_context = []
+        for p in pages:
+            elements = p.get('interactive_elements', {})
+            # Safely extract from dict built by DOM Analyzer
+            selectors = []
+            if isinstance(elements, dict):
+                for typ in ["buttons", "links", "inputs"]:
+                    for el in elements.get(typ, []):
+                        selectors.append(el.get("selector", {}).get("primary") or el.get("text") or el.get("name"))
+            elif isinstance(elements, list):
+                selectors = [el.get('selector') or el.get('text') for el in elements if el.get('selector') or el.get('text')]
+            
+            pages_context.append({"url": p['url'], "selectors_found": selectors[:15]})
+
         prompt = f"""
   App: {self.description}
   Pages found: {[p['url'] for p in pages]}
+  Available Selectors Context:
+  {pages_context[:5]}
   
-  Identify 3 user journeys as JSON.
+  Identify 3 user journeys as JSON using the actual selectors from the Context where possible.
   Each journey = ordered list of Playwright actions.
   
   Return ONLY this JSON format:
@@ -351,3 +388,65 @@ class CrawlerAgent:
             await asyncio.sleep(4)
 
         return {"journeys": [], "edge_cases": [], "risk_areas": []}
+
+    def _generate_user_journeys_deterministic(self, pages):
+        journeys = []
+        
+        # Journey 1: Search Flow (if search form found)
+        for page in pages:
+            for form in page.get("forms", []):
+                if form.get("purpose") == "search":
+                    steps = [{"action": "goto", "url": page["url"]}]
+                    
+                    for count, inp in enumerate(form.get("inputs", [])):
+                        if count == 0 and sum(1 for i in form.get("inputs", []) if i.get("type") in ["text", "search"]) == 1:
+                            # Primary search bar
+                            primary_selector = inp.get("selector", {}).get("primary") 
+                            if primary_selector:
+                                steps.append({"action": "fill", "selector": primary_selector, "value": "test search query"})
+                                break
+                                
+                    if form.get("buttons"):
+                        btn_selector = form["buttons"][0].get("selector", {}).get("primary")
+                        if btn_selector:
+                            steps.append({"action": "click", "selector": btn_selector})
+                            steps.append({"action": "wait", "ms": 2000})
+                            
+                    if len(steps) > 1:
+                        journeys.append({
+                            "name": "Deterministic Search Flow",
+                            "steps": steps
+                        })
+                        break
+            if journeys: break
+            
+        # Journey 2: Contact Form Delivery
+        for page in pages:
+            for form in page.get("forms", []):
+                if form.get("purpose") == "contact":
+                    steps = [{"action": "goto", "url": page["url"]}]
+                    has_submit = False
+                    for inp in form.get("inputs", []):
+                        selector = inp.get("selector", {}).get("primary")
+                        if not selector: continue
+                        if inp.get("type") == "email":
+                            steps.append({"action": "fill", "selector": selector, "value": "phantom@example.com"})
+                        else:
+                            steps.append({"action": "fill", "selector": selector, "value": "Phantom Test Data"})
+                            
+                    if form.get("buttons"):
+                        btn_selector = form["buttons"][0].get("selector", {}).get("primary")
+                        if btn_selector:
+                            steps.append({"action": "click", "selector": btn_selector})
+                            has_submit = True
+                            
+                    if has_submit:
+                        steps.append({"action": "wait", "ms": 2000})
+                        journeys.append({
+                            "name": "Deterministic Contact Form Submission",
+                            "steps": steps
+                        })
+                        break
+            if len(journeys) >= 2: break
+            
+        return journeys

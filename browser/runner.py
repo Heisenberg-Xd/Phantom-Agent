@@ -82,14 +82,12 @@ class PhantomBrowser:
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless,
             args=[
-                "--disable-images",
                 "--disable-extensions", 
                 "--disable-background-networking",
                 "--disable-default-apps",
                 "--no-sandbox",
                 "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--blink-settings=imagesEnabled=false"
+                "--disable-dev-shm-usage"
             ],
         )
         self._context = await self._browser.new_context(

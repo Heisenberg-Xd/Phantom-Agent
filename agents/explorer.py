@@ -16,6 +16,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from browser.runner import PhantomBrowser
+from browser.dom_analyzer import smart_find_element, generate_robust_selector
 
 logger = logging.getLogger("phantom")
 
@@ -102,61 +103,7 @@ KNOWN_BOOTSTRAPS = {
     }
 }
 
-async def find_element(page, hints: dict):
-    """
-    Multi-strategy element finder.
-    hints = {"type": "input|button|link|file", "purpose": "...", "label": "..."}
-    Returns the first visible locator, or None.
-    """
-    strategies = []
-    purpose = hints.get("purpose", "")
-    label = hints.get("label", "")
-
-    if purpose == "login_email":
-        strategies = [
-            'input[type="email"]',
-            'input[name="email"]',
-            'input[placeholder*="email" i]',
-            'input[id*="email" i]',
-            'input[type="text"]',
-        ]
-    elif purpose == "login_password":
-        strategies = [
-            'input[type="password"]',
-            'input[name="password"]',
-            'input[id*="password" i]',
-        ]
-    elif purpose == "submit":
-        strategies = [
-            'button[type="submit"]',
-            'input[type="submit"]',
-            f'button:has-text("{label}")',
-            'button:last-of-type',
-        ]
-    elif purpose == "file_upload":
-        strategies = [
-            'input[type="file"]',
-            '[data-testid*="upload"]',
-            '.upload-area',
-            '.dropzone',
-        ]
-    elif purpose == "search":
-        strategies = [
-            'input[type="search"]',
-            'input[placeholder*="search" i]',
-            'input[name="search"]',
-            'input[name="q"]',
-        ]
-
-    for selector in strategies:
-        try:
-            el = page.locator(selector).first
-            await el.wait_for(state="visible", timeout=3000)
-            return el
-        except Exception:
-            continue
-
-    return None
+# find_element is now handled by browser.dom_analyzer.smart_find_element
 
 
 # ── Login flow handler ────────────────────────────────────────────────────────
@@ -185,18 +132,18 @@ async def handle_login(page, base_url: str, credentials: dict = None) -> bool:
             )
             await page.wait_for_timeout(800)
 
-            email_field = await find_element(page, {"purpose": "login_email"})
+            email_field = await smart_find_element(page, {"all": ['input[type="email"]', 'input[name="email"]', 'input[type="text"]', '#uid']})
             if not email_field:
                 continue
 
-            password_field = await find_element(page, {"purpose": "login_password"})
+            password_field = await smart_find_element(page, {"all": ['input[type="password"]', 'input[name="password"]', '#passw']})
             if not password_field:
                 continue
 
             await email_field.fill(creds["email"])
             await password_field.fill(creds["password"])
 
-            submit = await find_element(page, {"purpose": "submit", "label": "Login"})
+            submit = await smart_find_element(page, {"all": ['button[type="submit"]', 'input[type="submit"]', '[type=submit]']})
             if submit:
                 await submit.click()
                 await page.wait_for_timeout(2000)
@@ -222,16 +169,14 @@ async def handle_login(page, base_url: str, credentials: dict = None) -> bool:
             )
             await page.wait_for_timeout(800)
 
-            email_f = await find_element(page, {"purpose": "login_email"})
-            pass_f = await find_element(page, {"purpose": "login_password"})
+            email_f = await smart_find_element(page, {"all": ['input[type="email"]', 'input[name="email"]', 'input[type="text"]', '#uid']})
+            pass_f = await smart_find_element(page, {"all": ['input[type="password"]', 'input[name="password"]', '#passw']})
 
             if email_f and pass_f:
                 await email_f.fill(creds["email"])
                 await pass_f.fill(creds["password"])
 
-                sub = await find_element(page, {"purpose": "submit", "label": "Register"})
-                if not sub:
-                    sub = await find_element(page, {"purpose": "submit", "label": "Sign Up"})
+                sub = await smart_find_element(page, {"all": ['button[type="submit"]', 'input[type="submit"]', '[type=submit]']})
                 if sub:
                     await sub.click()
                     await page.wait_for_timeout(2000)
@@ -256,7 +201,7 @@ async def test_file_upload(page, base_url: str) -> list:
         "oversized": ("big.pdf", b"A" * 11_000_000),
     }
 
-    upload_el = await find_element(page, {"purpose": "file_upload"})
+    upload_el = await smart_find_element(page, {"all": ['input[type="file"]', '[data-testid*="upload"]', '.upload-area']})
     if not upload_el:
         return []
 
@@ -352,14 +297,14 @@ class ExplorerAgent:
         """
         logger.info("[recovery] using legacy generic explorer path")
         try:
-            # Use longer 120s timeout for better hydration and complete fuzzing
+            # Use longer 300s timeout for better hydration and complete fuzzing
             if browser:
-                await asyncio.wait_for(self._run_exploration_on_browser(browser), timeout=120)
+                await asyncio.wait_for(self._run_exploration_on_browser(browser), timeout=300)
             else:
                 async with PhantomBrowser(self.screenshots_dir, headless=self.headless) as new_browser:
-                    await asyncio.wait_for(self._run_exploration_on_browser(new_browser), timeout=120)
+                    await asyncio.wait_for(self._run_exploration_on_browser(new_browser), timeout=300)
         except asyncio.TimeoutError:
-            logger.warning("[explorer] Phase 2 timeout — 120s limit reached")
+            logger.warning("[explorer] Phase 2 timeout — 300s limit reached")
         except Exception as e:
             logger.error(f"Explorer error: {e}")
 
@@ -670,14 +615,27 @@ class ExplorerAgent:
                 while time.time() - t_start < 15:
                     try:
                         if action in ("fill", "type", "input"):
-                            await browser.page.fill(selector, value, timeout=5000)
-                            success = True
-                            break
+                            elem = await smart_find_element(browser.page, selector) if isinstance(selector, dict) else browser.page.locator(selector).first
+                            if getattr(elem, 'fill', None):
+                                await elem.fill(value, timeout=5000)
+                                success = True
+                                break
+                            elif hasattr(browser.page, 'fill'):
+                                await browser.page.fill(selector, value, timeout=5000)
+                                success = True
+                                break
                         elif action in ("click", "tap"):
-                            await browser.page.click(selector, timeout=5000)
-                            await browser.wait_for_navigation(timeout=3000)
-                            success = True
-                            break
+                            elem = await smart_find_element(browser.page, selector) if isinstance(selector, dict) else browser.page.locator(selector).first
+                            if getattr(elem, 'click', None):
+                                await elem.click(timeout=5000)
+                                await browser.wait_for_navigation(timeout=3000)
+                                success = True
+                                break
+                            elif hasattr(browser.page, 'click'):
+                                await browser.page.click(selector, timeout=5000)
+                                await browser.wait_for_navigation(timeout=3000)
+                                success = True
+                                break
                         elif action == "press":
                             await browser.page.press(selector, value, timeout=5000)
                             success = True
@@ -758,12 +716,35 @@ class ExplorerAgent:
 
     async def _fuzz_forms(self, browser: PhantomBrowser, url: str, forms: list):
         """Fuzz forms with security-relevant inputs only."""
-        security_payloads = [
-            {"name": "SQL Injection", "value": "' OR '1'='1", "category": "security", "input_type": "sql_injection"},
-            {"name": "XSS", "value": "<script>alert('xss')</script>", "category": "security", "input_type": "xss"},
-            {"name": "Path Traversal", "value": "../../../../etc/passwd", "category": "security", "input_type": "path_traversal"},
-            {"name": "Empty submission", "value": "", "category": "validation", "input_type": "empty"},
-        ]
+        security_payloads = []
+        try:
+            import yaml
+            edge_cases_path = Path("config/edge_cases.yaml")
+            if edge_cases_path.exists():
+                with open(edge_cases_path, "r", encoding="utf-8") as f:
+                    edge_cases = yaml.safe_load(f)
+                
+                for attack in edge_cases.get("string_attacks", []):
+                    if attack.get("category") == "security":
+                        security_payloads.append({
+                            "name": attack.get("name"),
+                            "value": attack.get("value"),
+                            "category": "security",
+                            "input_type": "string"
+                        })
+                # Add default fallbacks if YAML is empty
+                if not security_payloads:
+                    raise ValueError("Empty security payloads from YAML")
+            else:
+                raise FileNotFoundError("edge_cases.yaml not found")
+        except Exception as e:
+            logger.warning(f"Could not load edge_cases.yaml ({e}), falling back to defaults.")
+            security_payloads = [
+                {"name": "SQL Injection", "value": "' OR '1'='1", "category": "security", "input_type": "sql_injection"},
+                {"name": "XSS", "value": "<script>alert('xss')</script>", "category": "security", "input_type": "xss"},
+                {"name": "Path Traversal", "value": "../../../../etc/passwd", "category": "security", "input_type": "path_traversal"},
+                {"name": "Empty submission", "value": "", "category": "validation", "input_type": "empty"},
+            ]
 
         for form in forms[:2]:  # limit to 2 forms per page
             inputs = form.get("inputs", [])
@@ -780,8 +761,11 @@ class ExplorerAgent:
             for attack in security_payloads:
                 try:
                     t = time.time()
-                    await browser.navigate(url, timeout=8000, take_screenshot=False)
+                    capture = await browser.navigate(url, timeout=8000, take_screenshot=False)
                     browser.clear_events()
+                    if not capture or not capture.title:
+                        logger.debug(f"Form fuzzing skipped - failed to load base url: {url}")
+                        continue
 
                     form_filled = False
                     for inp in fillable[:3]:

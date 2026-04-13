@@ -56,8 +56,8 @@ class ValidatorAgent:
             except Exception as e:
                 logger.error(f"validate_all event {i} error: {e}")
 
-            # 4-second rate-limit buffer between every API call
-            await asyncio.sleep(4)
+            # Token bucket / dynamic sleep not required with exponential backoff inside _generate_bug_report
+            await asyncio.sleep(2)
 
         return self.bug_reports
 
@@ -200,7 +200,10 @@ Then return a structured bug report as JSON ONLY (no markdown, no explanation):
                     f"Gemini API error in validator (attempt {attempt+1}/5): {e}. "
                     f"Retrying in {wait}s..."
                 )
-                if attempt < 4:
+                if getattr(e, 'code', None) == 429 or "429" in str(e):
+                    # Strict exponential backoff for rate limits
+                    await asyncio.sleep(wait * (2 ** attempt))
+                elif attempt < 4:
                     await asyncio.sleep(wait)
                 else:
                     logger.error("Gemini validator failed after all retries.")
