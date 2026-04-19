@@ -9,10 +9,10 @@
 
 **Autonomous QA Agent — powered by Gemini AI**
 
-> Your app's worst nightmare. Your team's best friend.
+> Your app's worst nightmare but Your team's best friend.
 
 An agent that crawls, breaks, and reports bugs in any web app.
-No test scripts. No setup. No source code access. Just a URL.
+No test scripts. No setup. No source code access. Just a URL..Dang.
 
 ```bash
 phantom scan --url "http://localhost:3000" --description "my app"
